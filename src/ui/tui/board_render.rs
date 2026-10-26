@@ -33,6 +33,7 @@ pub fn render_text_with_overlay(
     }
     lines.push(header);
     let last_move = game.last_move();
+    let ko_point = game.ko_point();
     for row_index in 0..size {
         let row = u16::from(size) - u16::from(row_index);
         let mut line = format!("{row:>width$} ", width = LABEL_WIDTH as usize - 1);
@@ -42,20 +43,27 @@ pub fn render_text_with_overlay(
                     .and_then(|line| line.get(col as usize))
                     .copied()
             });
-            let cell = text_cell(game.board(), size, col, row, point);
+            let cell = if point.is_none() && ko_point == Some((col, row)) && game.board().is_empty(col, row) {
+                "□ ".to_string()
+            } else {
+                text_cell(game.board(), size, col, row, point)
+            };
             line.push_str(&cell);
         }
         lines.push(line);
     }
     let captures = format!(
         "Black captures {} · White captures {} · move {}",
-        game.game.captures(Color::Black),
-        game.game.captures(Color::White),
-        game.move_number()
+        game.active_game_ref().captures(Color::Black),
+        game.active_game_ref().captures(Color::White),
+        game.displayed_move_number()
     );
     lines.push(captures);
     if let Some(coord) = last_move {
         lines.push(format!("last move: {}", coord.to_gtp()));
+    }
+    if let Some((kc, kr)) = ko_point {
+        lines.push(format!("ko point: {}", crate::engine::coord::Coord::new(kc, kr).to_gtp()));
     }
     lines.join("\n")
 }
@@ -91,7 +99,38 @@ pub fn text_cell(
     }
 }
 
+/// Returns true if `(col, row)` (0-based col, 1-based row from bottom) is a star point (hoshi)
+/// on a 9x9, 13x13, or 19x19 board.
+pub fn is_hoshi(size: u8, col: u8, row: u16) -> bool {
+    if row == 0 || row > u16::from(size) {
+        return false;
+    }
+    let row_index = (u16::from(size) - row) as u8;
+    is_hoshi_index(size, col, row_index)
+}
+
+fn is_hoshi_index(size: u8, col: u8, row_index: u8) -> bool {
+    match size {
+        9 => {
+            ((col == 2 || col == 6) && (row_index == 2 || row_index == 6))
+                || (col == 4 && row_index == 4)
+        }
+        13 => {
+            ((col == 3 || col == 9) && (row_index == 3 || row_index == 9))
+                || (col == 6 && row_index == 6)
+        }
+        19 => {
+            let pts = [3u8, 9, 15];
+            pts.contains(&col) && pts.contains(&row_index)
+        }
+        _ => false,
+    }
+}
+
 fn intersection(size: u8, col: u8, row_index: u8) -> char {
+    if is_hoshi_index(size, col, row_index) {
+        return '╋';
+    }
     let left = col > 0;
     let right = col + 1 < size;
     let up = row_index > 0;
@@ -214,13 +253,28 @@ fn cell_style(
         None => match game.board().get(col, row) {
             Some(color) => stone_cell(color, theme),
             None => {
-                let glyph = intersection(size, col, u8::try_from(row_index).unwrap_or(0));
-                let cell = if col + 1 < size {
-                    format!("{glyph}─")
+                if game.ko_point() == Some((col, row)) {
+                    (
+                        "□ ".to_string(),
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 } else {
-                    format!("{glyph} ")
-                };
-                (cell, Style::default().fg(theme.dim(theme.board)))
+                    let r_idx = u8::try_from(row_index).unwrap_or(0);
+                    let glyph = intersection(size, col, r_idx);
+                    let cell = if col + 1 < size {
+                        format!("{glyph}─")
+                    } else {
+                        format!("{glyph} ")
+                    };
+                    let fg = if is_hoshi_index(size, col, r_idx) {
+                        theme.board
+                    } else {
+                        theme.dim(theme.board)
+                    };
+                    (cell, Style::default().fg(fg))
+                }
             }
         },
     }
@@ -292,8 +346,12 @@ mod tests {
     }
 
     #[test]
-    fn intersection_glyphs_have_arms() {
-        assert_eq!(intersection(9, 4, 4), '┼');
+    fn intersection_glyphs_have_arms_and_hoshi_crosses() {
+        assert_eq!(intersection(9, 4, 4), '╋'); // 9x9 Tengen star point
+        assert_eq!(intersection(9, 2, 2), '╋'); // 9x9 corner star point
+        assert_eq!(intersection(13, 3, 3), '╋'); // 13x13 star point
+        assert_eq!(intersection(19, 9, 9), '╋'); // 19x19 Tengen star point
+        assert_eq!(intersection(9, 3, 4), '┼'); // normal interior intersection
         assert_eq!(intersection(9, 0, 0), '┌');
         assert_eq!(intersection(9, 8, 8), '┘');
         assert_eq!(intersection(9, 8, 0), '┐');
@@ -302,11 +360,13 @@ mod tests {
 
     #[test]
     fn text_cell_is_always_two_columns_for_empty_points() {
-        let board = Board::new(9);
-        for col in 0..9 {
-            for row in 1..=9 {
-                let cell = text_cell(&board, 9, col, row, None);
-                assert_eq!(cell.chars().count(), 2, "cell {col},{row}: {cell:?}");
+        for size in [9u8, 13, 19] {
+            let board = Board::new(size);
+            for col in 0..size {
+                for row in 1..=u16::from(size) {
+                    let cell = text_cell(&board, size, col, row, None);
+                    assert_eq!(cell.chars().count(), 2, "size {size} cell {col},{row}: {cell:?}");
+                }
             }
         }
     }

@@ -10,6 +10,7 @@
 //! [`Coord`] uses rows from the bottom, so conversion happens at the boundary.
 
 use super::board::{Board, Color};
+use super::clock::TimeControl;
 use super::coord::Coord;
 use super::game::Game;
 
@@ -59,6 +60,14 @@ pub struct SgfGame {
     pub komi: f64,
     pub player_black: Option<String>,
     pub player_white: Option<String>,
+    pub black_rank: Option<String>,
+    pub white_rank: Option<String>,
+    pub game_name: Option<String>,
+    pub event: Option<String>,
+    pub round: Option<String>,
+    pub handicap: Option<u8>,
+    pub main_time_secs: Option<u32>,
+    pub overtime: Option<String>,
     pub result: Option<String>,
     pub rules: Option<String>,
     pub date: Option<String>,
@@ -81,6 +90,18 @@ impl SgfGame {
             pos: 0,
         };
         parser.parse_collection()
+    }
+
+    /// Reconstructs the Engine [`TimeControl`] from `TM` and `OT` properties.
+    pub fn time_control(&self) -> TimeControl {
+        TimeControl::from_sgf_fields(self.main_time_secs, self.overtime.as_deref())
+    }
+
+    /// Sets `TM` and `OT` from an Engine [`TimeControl`].
+    pub fn set_time_control(&mut self, control: &TimeControl) {
+        let (tm, ot) = control.to_sgf_fields();
+        self.main_time_secs = tm;
+        self.overtime = ot;
     }
 
     /// Replays setup stones and moves onto a fresh [`Game`].
@@ -127,14 +148,38 @@ impl SgfGame {
         result.push(']');
         result.push_str(&format!("SZ[{}]", self.board_size));
         result.push_str(&format!("KM[{}]", format_float(self.komi)));
+        if let Some(handicap) = self.handicap.filter(|&h| h > 0) {
+            result.push_str(&format!("HA[{handicap}]"));
+        }
         if let Some(rules) = &self.rules {
             result.push_str(&format!("RU[{}]", escape(rules)));
+        }
+        if let Some(game_name) = &self.game_name {
+            result.push_str(&format!("GN[{}]", escape(game_name)));
+        }
+        if let Some(event) = &self.event {
+            result.push_str(&format!("EV[{}]", escape(event)));
+        }
+        if let Some(round) = &self.round {
+            result.push_str(&format!("RO[{}]", escape(round)));
         }
         if let Some(name) = &self.player_black {
             result.push_str(&format!("PB[{}]", escape(name)));
         }
+        if let Some(rank) = &self.black_rank {
+            result.push_str(&format!("BR[{}]", escape(rank)));
+        }
         if let Some(name) = &self.player_white {
             result.push_str(&format!("PW[{}]", escape(name)));
+        }
+        if let Some(rank) = &self.white_rank {
+            result.push_str(&format!("WR[{}]", escape(rank)));
+        }
+        if let Some(main_secs) = self.main_time_secs {
+            result.push_str(&format!("TM[{main_secs}]"));
+        }
+        if let Some(overtime) = &self.overtime {
+            result.push_str(&format!("OT[{}]", escape(overtime)));
         }
         if let Some(date) = &self.date {
             result.push_str(&format!("DT[{}]", escape(date)));
@@ -217,10 +262,7 @@ pub fn from_game(
         komi,
         player_black: black,
         player_white: white,
-        result: None,
-        rules: None,
-        date: None,
-        comment: None,
+        ..SgfGame::default()
     }
 }
 
@@ -437,6 +479,17 @@ impl SgfGame {
                 "KM" => {
                     self.komi = first.parse::<f64>().map_err(|_| SgfError::InvalidKomi)?
                 }
+                "HA" => {
+                    self.handicap = first.trim().parse::<u8>().ok();
+                }
+                "TM" => {
+                    if let Ok(seconds) = first.trim().parse::<f64>() {
+                        if seconds >= 0.0 {
+                            self.main_time_secs = Some(seconds.round() as u32);
+                        }
+                    }
+                }
+                "OT" => self.overtime = Some(first.to_string()),
                 "B" | "W" => {
                     let color = if key == "B" {
                         Color::Black
@@ -470,6 +523,11 @@ impl SgfGame {
                 }
                 "PB" => self.player_black = Some(first.to_string()),
                 "PW" => self.player_white = Some(first.to_string()),
+                "BR" => self.black_rank = Some(first.to_string()),
+                "WR" => self.white_rank = Some(first.to_string()),
+                "GN" => self.game_name = Some(first.to_string()),
+                "EV" => self.event = Some(first.to_string()),
+                "RO" => self.round = Some(first.to_string()),
                 "RE" => self.result = Some(first.to_string()),
                 "RU" => self.rules = Some(first.to_string()),
                 "DT" => self.date = Some(first.to_string()),
@@ -524,6 +582,7 @@ impl std::error::Error for SgfError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn parse_basic() {
@@ -556,13 +615,35 @@ mod tests {
 
     #[test]
     fn parse_komi_and_players() {
-        let sgf = "(;GM[1]FF[4]SZ[9]KM[5.5]PB[Alice]PW[Bob]RU[chinese]RE[B+R]DT[2026-10-19];B[cc])";
+        let sgf = "(;GM[1]FF[4]SZ[9]KM[5.5]PB[Alice]PW[Bob]BR[3d]WR[4d]GN[Test Match]EV[Cup]RO[1]HA[2]TM[600]OT[5x30 byo-yomi]RU[chinese]RE[B+R]DT[2026-10-19];B[cc])";
         let game = SgfGame::parse(sgf).unwrap();
         assert_eq!(game.komi, 5.5);
         assert_eq!(game.player_black.as_deref(), Some("Alice"));
         assert_eq!(game.player_white.as_deref(), Some("Bob"));
+        assert_eq!(game.black_rank.as_deref(), Some("3d"));
+        assert_eq!(game.white_rank.as_deref(), Some("4d"));
+        assert_eq!(game.game_name.as_deref(), Some("Test Match"));
+        assert_eq!(game.event.as_deref(), Some("Cup"));
+        assert_eq!(game.round.as_deref(), Some("1"));
+        assert_eq!(game.handicap, Some(2));
+        assert_eq!(game.main_time_secs, Some(600));
+        assert_eq!(game.overtime.as_deref(), Some("5x30 byo-yomi"));
+        assert_eq!(
+            game.time_control(),
+            TimeControl::Byoyomi {
+                main: Duration::from_secs(600),
+                periods: 5,
+                period: Duration::from_secs(30),
+            }
+        );
         assert_eq!(game.rules.as_deref(), Some("chinese"));
         assert_eq!(game.result.as_deref(), Some("B+R"));
+
+        let roundtrip = SgfGame::parse(&game.to_sgf()).unwrap();
+        assert_eq!(roundtrip.black_rank, game.black_rank);
+        assert_eq!(roundtrip.white_rank, game.white_rank);
+        assert_eq!(roundtrip.game_name, game.game_name);
+        assert_eq!(roundtrip.time_control(), game.time_control());
     }
 
     #[test]

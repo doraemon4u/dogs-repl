@@ -1,0 +1,12 @@
+{
+  "name": "ogs-tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node server.mjs",
+    "build": "node --check server.mjs",
+    "start": "node server.mjs",
+    "lint": "node --check server.mjs"
+  }
+}

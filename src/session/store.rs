@@ -14,12 +14,19 @@ use crate::engine::board::{Board, Color};
 use crate::engine::clock::{Clock, TimeControl};
 use crate::engine::coord::Coord;
 use crate::engine::estimate::{
-    connected_stone_group, estimate_with_dead, score, PointEstimate, ScoreSummary, ScoringRules,
+    auto_detect_dead, connected_stone_group, estimate_with_dead, score, PointEstimate,
+    ScoreSummary, ScoringRules, DEFAULT_PLAYOUTS,
 };
 use crate::engine::game::Game;
+use crate::engine::sgf::{SgfGame, SgfMove};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
+
+/// Built-in fallback world language channels when the server does not advertise a list.
+pub const DEFAULT_WORLD_CHANNELS: &[&str] = &[
+    "en", "zh", "ja", "ko", "de", "fr", "es", "ru", "pt", "it",
+];
 
 /// Maximum number of chat lines retained per channel.
 pub const CHAT_CAPACITY: usize = 500;
@@ -237,6 +244,10 @@ pub struct GameView {
     /// Official server-side stone-removal negotiation state.
     pub scoring_dead: HashSet<Point>,
     pub scoring_last_message: Option<String>,
+    /// Non-destructive review cursor (`None` means following the latest move).
+    pub view_move: Option<u16>,
+    /// Cached snapshot at `view_move` when reviewing an earlier move.
+    pub review_game: Option<Game>,
 }
 
 impl GameView {
@@ -261,23 +272,105 @@ impl GameView {
             estimate_summary: None,
             scoring_dead: HashSet::new(),
             scoring_last_message: None,
+            view_move: None,
+            review_game: None,
         }
     }
 
     pub fn board(&self) -> &Board {
-        self.game.board()
+        self.review_game
+            .as_ref()
+            .unwrap_or(&self.game)
+            .board()
+    }
+
+    pub fn active_game_ref(&self) -> &Game {
+        self.review_game.as_ref().unwrap_or(&self.game)
     }
 
     pub fn to_play(&self) -> Color {
-        self.game.to_play()
+        self.active_game_ref().to_play()
+    }
+
+    pub fn ko_point(&self) -> Option<(u8, u16)> {
+        self.active_game_ref().ko_point()
     }
 
     pub fn move_number(&self) -> u16 {
         self.game.move_number()
     }
 
+    /// Move number currently shown on the board (differs from `move_number()`
+    /// while stepping through history).
+    pub fn displayed_move_number(&self) -> u16 {
+        self.view_move
+            .map(|n| n.min(self.game.move_number()))
+            .unwrap_or_else(|| self.game.move_number())
+    }
+
+    /// True when the review cursor is pinned to an earlier move.
+    pub fn is_reviewing(&self) -> bool {
+        self.displayed_move_number() < self.game.move_number()
+    }
+
     pub fn last_move(&self) -> Option<Coord> {
-        self.game.last_move().and_then(|mv| mv.coord)
+        self.active_game_ref()
+            .last_move()
+            .and_then(|mv| mv.coord)
+    }
+
+    /// Validates whether `coord` is a legal move on the currently displayed board
+    /// (checking bounds, occupied, simple ko, dead-eye suicide, and positional superko).
+    pub fn validate_move(&self, coord: Coord) -> Result<usize, crate::engine::rules::MoveError> {
+        self.active_game_ref().validate(coord)
+    }
+
+    /// Branches from the current review cursor (if reviewing) and plays `coord` on the local board.
+    pub fn play_local_move(&mut self, coord: Coord) -> Result<Color, crate::engine::rules::MoveError> {
+        self.validate_move(coord)?;
+        if let Some(cursor) = self.view_move {
+            let _ = self.game.truncate_to(cursor);
+            self.view_move = None;
+            self.review_game = None;
+        }
+        let color = self.game.to_play();
+        self.game.play(coord)?;
+        self.clock.on_move(color);
+        if self.estimate_active {
+            self.recompute_estimate();
+        }
+        Ok(color)
+    }
+
+    /// Moves the non-destructive review cursor to `target` (`None` returns to live).
+    pub fn set_view_move(&mut self, target: Option<u16>) -> u16 {
+        let total = self.game.move_number();
+        match target {
+            Some(number) if number < total => {
+                self.view_move = Some(number);
+                self.review_game = Some(self.game.game_at(number));
+            }
+            _ => {
+                self.view_move = None;
+                self.review_game = None;
+            }
+        }
+        if self.estimate_active {
+            self.recompute_estimate();
+        }
+        self.displayed_move_number()
+    }
+
+    /// Steps the review cursor by `delta` moves (negative = backward, positive = forward).
+    pub fn step_view(&mut self, delta: i32) -> u16 {
+        let current = i32::from(self.displayed_move_number());
+        let total = i32::from(self.game.move_number());
+        let next = (current + delta).clamp(0, total) as u16;
+        if next >= self.game.move_number() {
+            self.set_view_move(None)
+        } else {
+            self.set_view_move(Some(next))
+        }
     }
 
     /// The overlay used by estimate mode.
@@ -288,18 +381,33 @@ impl GameView {
     /// Recomputes and stores the local estimate. Local only: this is never sent
     /// as the official result.
     pub fn recompute_estimate(&mut self) -> ScoreSummary {
+        let captures = self
+            .review_game
+            .as_ref()
+            .map(|g| (g.captures(Color::Black), g.captures(Color::White)))
+            .unwrap_or_else(|| {
+                (
+                    self.game.captures(Color::Black),
+                    self.game.captures(Color::White),
+                )
+            });
         let summary = score(
             self.board(),
             &self.estimate_dead,
             self.komi,
             ScoringRules::from_ogs(&self.rules),
-            (
-                self.game.captures(Color::Black),
-                self.game.captures(Color::White),
-            ),
+            captures,
         );
         self.estimate_summary = Some(summary.clone());
         summary
+    }
+
+    /// Runs Monte-Carlo automatic dead-stone detection on the currently displayed board,
+    /// enters estimate mode, and recomputes the local score summary.
+    pub fn auto_estimate(&mut self) -> ScoreSummary {
+        self.estimate_active = true;
+        self.estimate_dead = auto_detect_dead(self.board(), DEFAULT_PLAYOUTS);
+        self.recompute_estimate()
     }
 
     /// Toggles the dead marker of the connected group at `coord`.
@@ -358,15 +466,86 @@ impl GameView {
         Ok(())
     }
 
+    /// Converts this game view into an [`SgfGame`] with full metadata and time control.
+    pub fn to_sgf_game(&self) -> SgfGame {
+        let mut sgf = SgfGame::new(self.size);
+        sgf.komi = self.komi;
+        sgf.rules = Some(self.rules.clone());
+        sgf.player_black = Some(self.black.clone());
+        sgf.player_white = Some(self.white.clone());
+        sgf.game_name = Some(format!("OGS Game #{}", self.id));
+        sgf.result = self.result.clone();
+        sgf.set_time_control(self.clock.control());
+        for &(color, coord) in self.game.setup_stones() {
+            match color {
+                Color::Black => sgf.setup_black.push(coord),
+                Color::White => sgf.setup_white.push(coord),
+            }
+        }
+        sgf.moves = self
+            .game
+            .history()
+            .iter()
+            .map(|mv| SgfMove {
+                color: mv.color,
+                coord: mv.coord,
+                comment: None,
+            })
+            .collect();
+        sgf
+    }
+
+    /// Builds a [`GameView`] from a parsed [`SgfGame`].
+    pub fn from_sgf_game(id: u64, sgf: &SgfGame) -> Result<Self, String> {
+        let game = sgf.replay_game()?;
+        let size = game.size();
+        let mut view = Self::empty(id, size);
+        view.size = size;
+        view.komi = sgf.komi;
+        if let Some(rules) = &sgf.rules {
+            view.rules = rules.to_ascii_lowercase();
+        }
+        if let Some(black) = &sgf.player_black {
+            view.black = black.clone();
+        }
+        if let Some(white) = &sgf.player_white {
+            view.white = white.clone();
+        }
+        view.result = sgf.result.clone();
+        view.phase = if sgf.result.is_some() {
+            GamePhase::Finished
+        } else {
+            GamePhase::Play
+        };
+        let active = if view.phase == GamePhase::Play {
+            Some(game.to_play())
+        } else {
+            None
+        };
+        view.clock = Clock::new(sgf.time_control(), active);
+        view.game = game;
+        view.connected = true;
+        Ok(view)
+    }
+
     /// A compact game line for the TUI title.
     pub fn title(&self) -> String {
+        let move_part = if self.is_reviewing() {
+            format!(
+                "move {}/{} (review)",
+                self.displayed_move_number(),
+                self.game.move_number()
+            )
+        } else {
+            format!("move {}", self.game.move_number())
+        };
         format!(
-            "{} vs {} · {}x{} · move {} · {}",
+            "{} vs {} · {}x{} · {} · {}",
             self.black,
             self.white,
             self.size,
             self.size,
-            self.game.move_number(),
+            move_part,
             self.phase.label()
         )
     }
@@ -629,31 +808,81 @@ impl Store {
 
     /// Applies `/chat/channels/` (or the equivalent part of `/ui/config`).
     pub fn apply_chat_channels(&mut self, value: &Value) {
-        let rows = value
+        let mut names = Vec::new();
+        let mut add_channel = |name: String, topic: Option<String>, store: &mut Self| {
+            let trimmed = name.trim().trim_start_matches('#').to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            if let Some(topic) = topic {
+                store.ensure_channel(&trimmed).topic = Some(topic);
+            } else {
+                store.ensure_channel(&trimmed);
+            }
+            if !names.contains(&trimmed) {
+                names.push(trimmed);
+            }
+        };
+
+        if let Some(rows) = value
             .get("results")
             .and_then(Value::as_array)
-            .cloned()
-            .or_else(|| value.as_array().cloned())
-            .unwrap_or_default();
-        let mut names = Vec::new();
-        for row in rows {
-            let name = row
-                .get("name")
-                .or_else(|| row.get("id"))
-                .and_then(value_as_string)
-                .unwrap_or_default();
-            if name.is_empty() {
-                continue;
+            .or_else(|| value.get("channels").and_then(Value::as_array))
+            .or_else(|| value.get("language_channels").and_then(Value::as_array))
+            .or_else(|| value.get("chat_channels").and_then(Value::as_array))
+            .or_else(|| value.as_array())
+        {
+            for row in rows {
+                if let Some(text) = row.as_str() {
+                    add_channel(text.to_string(), None, self);
+                    continue;
+                }
+                let name = row
+                    .get("name")
+                    .or_else(|| row.get("code"))
+                    .or_else(|| row.get("channel"))
+                    .or_else(|| row.get("id"))
+                    .and_then(value_as_string)
+                    .unwrap_or_default();
+                let topic = row
+                    .get("topic")
+                    .or_else(|| row.get("description"))
+                    .or_else(|| row.get("title"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                add_channel(name, topic, self);
             }
-            let topic = row
-                .get("topic")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            self.ensure_channel(&name).topic = topic;
-            names.push(name);
+        } else if let Some(map) = value
+            .get("language_channels")
+            .and_then(Value::as_object)
+            .or_else(|| value.get("chat_channels").and_then(Value::as_object))
+            .or_else(|| value.as_object())
+        {
+            for (key, entry) in map {
+                if matches!(
+                    key.as_str(),
+                    "results" | "count" | "next" | "previous" | "user_jwt"
+                ) {
+                    continue;
+                }
+                let topic = entry
+                    .get("topic")
+                    .or_else(|| entry.get("description"))
+                    .or_else(|| entry.get("name"))
+                    .and_then(Value::as_str)
+                    .or_else(|| entry.as_str())
+                    .map(str::to_string);
+                add_channel(key.clone(), topic, self);
+            }
         }
+
         if !names.is_empty() {
             self.available_channels = names;
+        } else if self.available_channels.is_empty() {
+            self.available_channels = DEFAULT_WORLD_CHANNELS
+                .iter()
+                .map(|ch| (*ch).to_string())
+                .collect();
         }
     }
 
@@ -1077,6 +1306,8 @@ pub fn game_view_from_json(value: &Value, user_id: Option<i64>) -> Option<GameVi
         estimate_summary: None,
         scoring_dead: HashSet::new(),
         scoring_last_message: None,
+        view_move: None,
+        review_game: None,
     };
     if let Some(removed) = value
         .get("removed_stones")
@@ -1093,18 +1324,50 @@ pub fn game_view_from_json(value: &Value, user_id: Option<i64>) -> Option<GameVi
 fn clock_seconds(value: &Value) -> Option<f64> {
     match value {
         Value::Number(number) => number.as_f64(),
-        Value::Object(map) => ["remaining", "main", "main_time", "time"]
-            .iter()
-            .find_map(|key| map.get(*key).and_then(Value::as_f64)),
+        Value::Object(map) => [
+            "remaining",
+            "main",
+            "main_time",
+            "thinking_time",
+            "time",
+        ]
+        .iter()
+        .find_map(|key| map.get(*key).and_then(Value::as_f64)),
         _ => None,
     }
+}
+
+fn clock_overtime(value: &Value) -> (Option<u32>, Option<f64>, Option<u32>) {
+    let Some(map) = value.as_object() else {
+        return (None, None, None);
+    };
+    let periods = map
+        .get("periods")
+        .or_else(|| map.get("periods_left"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    let period_time = map
+        .get("period_time")
+        .or_else(|| map.get("period_time_left"))
+        .or_else(|| map.get("block_time"))
+        .and_then(Value::as_f64);
+    let stones_left = map
+        .get("moves_left")
+        .or_else(|| map.get("stones_left"))
+        .and_then(Value::as_u64)
+        .map(|n| n as u32);
+    (periods, period_time, stones_left)
 }
 
 /// Applies a `game/<id>/clock` push.
 pub fn apply_clock_update(game: &mut GameView, value: &Value) {
     for (key, color) in [("black_time", Color::Black), ("white_time", Color::White)] {
-        if let Some(seconds) = value.get(key).and_then(clock_seconds) {
-            game.clock.set_main(color, seconds);
+        if let Some(entry) = value.get(key) {
+            if let Some(seconds) = clock_seconds(entry) {
+                let (periods, period_time, stones_left) = clock_overtime(entry);
+                game.clock
+                    .sync_player(color, seconds, periods, period_time, stones_left);
+            }
         }
     }
     if let Some(current) = value
@@ -1454,5 +1717,46 @@ mod tests {
         // Reset with empty string
         apply_removed_stones(game, &json!({"removed_stones": ""}));
         assert_eq!(game.scoring_dead.len(), 0);
+    }
+
+    #[test]
+    fn step_view_navigates_history_and_returns_to_live() {
+        let mut view = game_view_from_json(&game_json(), None).unwrap();
+        assert_eq!(view.move_number(), 3);
+        assert_eq!(view.displayed_move_number(), 3);
+        assert!(!view.is_reviewing());
+
+        assert_eq!(view.step_view(-2), 1);
+        assert!(view.is_reviewing());
+        assert_eq!(view.displayed_move_number(), 1);
+        assert_eq!(view.board().get(2, 7), Some(Color::Black));
+        assert_eq!(view.board().get(6, 3), None);
+
+        assert_eq!(view.step_view(10), 3);
+        assert!(!view.is_reviewing());
+        assert_eq!(view.board().get(6, 3), Some(Color::White));
+    }
+
+    #[test]
+    fn apply_chat_channels_supports_objects_strings_and_fallback() {
+        let mut store = Store::new("en");
+        store.apply_chat_channels(&json!(null));
+        assert!(!store.available_channels.is_empty());
+        assert!(store.available_channels.contains(&"en".to_string()));
+        assert!(store.available_channels.contains(&"zh".to_string()));
+
+        store.apply_chat_channels(&json!(["en", "ja", "fr"]));
+        assert_eq!(store.available_channels, vec!["en", "ja", "fr"]);
+
+        store.apply_chat_channels(&json!({
+            "en": {"topic": "English chat"},
+            "de": {"topic": "Deutsch"}
+        }));
+        assert!(store.available_channels.contains(&"en".to_string()));
+        assert!(store.available_channels.contains(&"de".to_string()));
+        assert_eq!(
+            store.channels["en"].topic.as_deref(),
+            Some("English chat")
+        );
     }
 }

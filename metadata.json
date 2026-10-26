@@ -1,0 +1,5 @@
+{
+  "name": "OGS REPL & TUI Client",
+  "description": "Terminal and REPL client for Online-Go.com (OGS) featuring a pure Go engine, Monte-Carlo dead-stone territory estimation, SGF import/export with review stepping, and Zellij-inspired TUI panes.",
+  "requestFramePermissions": []
+}

@@ -8,6 +8,7 @@
 use super::board::{Board, Color};
 use super::coord::Coord;
 use super::rules::{self, MoveError};
+use std::collections::HashSet;
 
 /// One move in the game history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,13 +34,17 @@ pub struct Game {
     captured: [u16; 2],
     history: Vec<PlayedMove>,
     setup: Vec<(Color, Coord)>,
+    prior_positions: HashSet<Vec<Option<Color>>>,
 }
 
 impl Game {
     /// Creates an empty game with Black to play.
     pub fn new(size: u8) -> Self {
+        let board = Board::new(size);
+        let mut prior_positions = HashSet::new();
+        prior_positions.insert(board.grid_signature().to_vec());
         Self {
-            board: Board::new(size),
+            board,
             to_play: Color::Black,
             initial_to_play: Color::Black,
             ko_point: None,
@@ -48,6 +53,7 @@ impl Game {
             captured: [0, 0],
             history: Vec::new(),
             setup: Vec::new(),
+            prior_positions,
         }
     }
 
@@ -65,6 +71,10 @@ impl Game {
 
     pub const fn ko_point(&self) -> Option<(u8, u16)> {
         self.ko_point
+    }
+
+    pub fn prior_positions(&self) -> &HashSet<Vec<Option<Color>>> {
+        &self.prior_positions
     }
 
     pub const fn move_number(&self) -> u16 {
@@ -111,6 +121,11 @@ impl Game {
         }
         self.board.place(coord.col, coord.row, color);
         self.setup.push((color, coord));
+        if self.history.is_empty() {
+            self.prior_positions.clear();
+            self.prior_positions
+                .insert(self.board.grid_signature().to_vec());
+        }
         Ok(())
     }
 
@@ -127,16 +142,40 @@ impl Game {
         self.consecutive_passes >= 2
     }
 
+    /// Validates whether `coord` is legal for `self.to_play()` without mutating the game.
+    pub fn validate(&self, coord: Coord) -> Result<usize, MoveError> {
+        if !coord.is_on_board(self.size()) {
+            return Err(MoveError::OffBoard);
+        }
+        rules::validate_move_with_superko(
+            self.board(),
+            coord.col,
+            coord.row,
+            self.to_play,
+            self.ko_point,
+            &self.prior_positions,
+        )
+    }
+
     /// Plays a move for `to_play`.
     pub fn play(&mut self, coord: Coord) -> Result<&PlayedMove, MoveError> {
         if !coord.is_on_board(self.size()) {
             return Err(MoveError::OffBoard);
         }
         let color = self.to_play;
-        rules::validate_move(self.board(), coord.col, coord.row, color, self.ko_point)?;
+        rules::validate_move_with_superko(
+            self.board(),
+            coord.col,
+            coord.row,
+            color,
+            self.ko_point,
+            &self.prior_positions,
+        )?;
         let captured = rules::execute_move(&mut self.board, coord.col, coord.row, color);
         self.record_captures(color, &captured);
         self.ko_point = detect_ko(&self.board, coord.col, coord.row, &captured);
+        self.prior_positions
+            .insert(self.board.grid_signature().to_vec());
         self.push_move(color, Some(coord), captured);
         Ok(self.history.last().expect("move was just pushed"))
     }
@@ -151,10 +190,19 @@ impl Game {
         if !coord.is_on_board(self.size()) {
             return Err(MoveError::OffBoard);
         }
-        rules::validate_move(self.board(), coord.col, coord.row, color, self.ko_point)?;
+        rules::validate_move_with_superko(
+            self.board(),
+            coord.col,
+            coord.row,
+            color,
+            self.ko_point,
+            &self.prior_positions,
+        )?;
         let captured = rules::execute_move(&mut self.board, coord.col, coord.row, color);
         self.record_captures(color, &captured);
         self.ko_point = detect_ko(&self.board, coord.col, coord.row, &captured);
+        self.prior_positions
+            .insert(self.board.grid_signature().to_vec());
         self.push_move(color, Some(coord), captured);
         Ok(self.history.last().expect("move was just pushed"))
     }
@@ -269,6 +317,26 @@ impl Game {
             }
         }
         Ok(())
+    }
+
+    /// Returns a non-destructive snapshot of the game at `move_number`.
+    pub fn game_at(&self, move_number: u16) -> Self {
+        let mut copy = self.clone();
+        if (move_number as usize) < copy.history.len() {
+            let _ = copy.truncate_to(move_number);
+        }
+        copy
+    }
+
+    /// Returns the board position after `move_number` moves.
+    pub fn board_at(&self, move_number: u16) -> Board {
+        self.game_at(move_number).board().clone()
+    }
+
+    /// Returns `(black_captures, white_captures)` after `move_number` moves.
+    pub fn captures_at(&self, move_number: u16) -> (u16, u16) {
+        let snap = self.game_at(move_number);
+        (snap.captures(Color::Black), snap.captures(Color::White))
     }
 
     fn record_captures(&mut self, color: Color, captured: &[(u8, u16)]) {
@@ -468,6 +536,21 @@ mod tests {
     }
 
     #[test]
+    fn game_at_is_non_destructive() {
+        let mut game = Game::new(9);
+        game.play(c(2, 2)).unwrap();
+        game.play(c(6, 6)).unwrap();
+        game.play(c(3, 3)).unwrap();
+        let snap = game.game_at(1);
+        assert_eq!(snap.move_number(), 1);
+        assert_eq!(snap.board().get(2, 2), Some(Color::Black));
+        assert_eq!(snap.board().get(6, 6), None);
+        // Original game still has all 3 moves.
+        assert_eq!(game.move_number(), 3);
+        assert_eq!(game.board().get(3, 3), Some(Color::Black));
+    }
+
+    #[test]
     fn undo_and_truncate_to_zero_preserve_white_initial_turn() {
         let mut game = Game::new(9);
         game.set_to_play(Color::White);
@@ -483,5 +566,38 @@ mod tests {
         game.truncate_to(0).unwrap();
         assert_eq!(game.to_play(), Color::White);
         assert_eq!(game.move_number(), 0);
+    }
+
+    #[test]
+    fn dead_eye_suicide_and_superko_are_rejected() {
+        let setup = [
+            (Color::Black, c(0, 3)),
+            (Color::White, c(1, 3)),
+            (Color::Black, c(2, 3)),
+            (Color::White, c(0, 2)),
+            (Color::Black, c(1, 2)),
+            (Color::Black, c(3, 2)),
+            (Color::Black, c(4, 2)),
+            (Color::Black, c(0, 1)),
+            (Color::White, c(1, 1)),
+            (Color::Black, c(2, 1)),
+            // Dead eye for White at (8,1) surrounded by Black at (7,1) and (8,2)
+            (Color::Black, c(7, 1)),
+            (Color::Black, c(8, 2)),
+        ];
+        let mut game = Game::from_setup_and_moves(9, &setup, &[]).unwrap();
+        game.set_to_play(Color::White);
+        // White cannot play into the dead eye at (8,1)
+        assert_eq!(game.play(c(8, 1)), Err(MoveError::Suicide));
+
+        // White captures at (2,2), creating ko at (1,2)
+        game.play(c(2, 2)).unwrap();
+        // Immediate recapture at (1,2) is rejected by Ko
+        assert_eq!(game.play(c(1, 2)), Err(MoveError::Ko));
+        // If both players pass (clearing simple ko without changing the board),
+        // recapturing at (1,2) would recreate the initial setup board position and is rejected by Superko!
+        game.pass();
+        game.pass();
+        assert_eq!(game.play(c(1, 2)), Err(MoveError::Superko));
     }
 }

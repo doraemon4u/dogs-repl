@@ -105,12 +105,12 @@
 
 按优先级消化第 11 节清单:
 
-- [ ] 焦点面板切换按键绑定(Tab / Ctrl+1-3)
-- [ ] truecolor 检测与降级配色
-- [ ] 估分自动死活检测(迁移 `goban` 蒙特卡洛逻辑)
-- [ ] 世界聊天语言频道动态拉取
-- [ ] 时间制(byo-yomi/fischer/canadian)状态机
-- [ ] SGF 完整导入导出打磨
+- [x] 焦点面板切换按键绑定(Tab / Shift+Tab / Ctrl+1-3 / `focus <pane>`)
+- [x] truecolor 检测与降级配色(`ColorSupport::detect()` 支持 TrueColor / Ansi256 / Ansi16)
+- [x] 估分自动死活检测(迁移蒙特卡洛随机终局模拟逻辑 `estimate auto`,并保留 `[a10]` 手动切换)
+- [x] 世界聊天语言频道动态拉取(支持 `/chat/channels/` 与 `/ui/config` 多形态解析及离线默认频道回退)
+- [x] 时间制(byo-yomi/fischer/canadian)状态机与 SGF `TM`/`OT` 双向转换、对局时钟读秒同步
+- [x] SGF 完整导入导出打磨(`sgf load <path>` / `sgf save <path>`、完整元信息读写、`step`/`prev`/`next`/`first`/`last`/`goto` 非破坏性复盘步进)
 
 这些均不影响阶段 0–4 骨架的可用性,可按实际时间灵活排期。
 

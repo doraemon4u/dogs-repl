@@ -53,6 +53,106 @@ impl TimeControl {
     pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
+
+    /// Serializes this time control to standard SGF `TM` (seconds) and `OT`
+    /// (overtime description) fields.
+    pub fn to_sgf_fields(&self) -> (Option<u32>, Option<String>) {
+        match self {
+            Self::None => (None, None),
+            Self::Absolute { main } => (Some(main.as_secs() as u32), Some("none".to_string())),
+            Self::Byoyomi {
+                main,
+                periods,
+                period,
+            } => (
+                Some(main.as_secs() as u32),
+                Some(format!("{}x{} byo-yomi", periods, period.as_secs())),
+            ),
+            Self::Fischer { main, increment } => (
+                Some(main.as_secs() as u32),
+                Some(format!("{} fischer", increment.as_secs())),
+            ),
+            Self::Canadian {
+                main,
+                stones,
+                period,
+            } => (
+                Some(main.as_secs() as u32),
+                Some(format!("{}/{} canadian", stones, period.as_secs())),
+            ),
+        }
+    }
+
+    /// Parses SGF `TM` (main time in seconds) and `OT` (overtime string) into a
+    /// [`TimeControl`].
+    pub fn from_sgf_fields(main_secs: Option<u32>, overtime: Option<&str>) -> Self {
+        let main = Duration::from_secs(u64::from(main_secs.unwrap_or(0)));
+        let Some(ot_raw) = overtime.map(str::trim).filter(|s| !s.is_empty()) else {
+            return if main.is_zero() {
+                Self::None
+            } else {
+                Self::Absolute { main }
+            };
+        };
+        let lower = ot_raw.to_ascii_lowercase();
+        if lower == "none" || lower == "-" {
+            return if main.is_zero() {
+                Self::None
+            } else {
+                Self::Absolute { main }
+            };
+        }
+        if lower.contains("byo") {
+            // e.g. "5x30 byo-yomi" or "5x30s byo-yomi"
+            let token = lower.split_whitespace().next().unwrap_or_default();
+            if let Some((p_str, t_str)) = token.split_once('x') {
+                let periods = p_str.trim().parse::<u32>().unwrap_or(5).max(1);
+                let secs = t_str
+                    .trim_end_matches('s')
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(30);
+                return Self::Byoyomi {
+                    main,
+                    periods,
+                    period: Duration::from_secs(secs),
+                };
+            }
+        }
+        if lower.contains("canadian") || lower.contains('/') {
+            // e.g. "25/600 canadian"
+            let token = lower.split_whitespace().next().unwrap_or_default();
+            if let Some((s_str, t_str)) = token.split_once('/') {
+                let stones = s_str.trim().parse::<u32>().unwrap_or(25).max(1);
+                let secs = t_str
+                    .trim_end_matches('s')
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(300);
+                return Self::Canadian {
+                    main,
+                    stones,
+                    period: Duration::from_secs(secs),
+                };
+            }
+        }
+        if lower.contains("fischer") || lower.contains('+') {
+            let num_token = lower
+                .split(|c: char| !c.is_ascii_digit())
+                .find(|s| !s.is_empty())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5);
+            return Self::Fischer {
+                main,
+                increment: Duration::from_secs(num_token),
+            };
+        }
+        if main.is_zero() {
+            Self::None
+        } else {
+            Self::Absolute { main }
+        }
+    }
 }
 
 /// One player's clock.
@@ -302,6 +402,30 @@ impl Clock {
         let seconds = seconds.max(0.0);
         self.player_mut(color).main = Duration::from_secs_f64(seconds);
     }
+
+    /// Synchronizes main and overtime clock fields from a server clock object.
+    pub fn sync_player(
+        &mut self,
+        color: Color,
+        main_seconds: Option<f64>,
+        periods_left: Option<u32>,
+        period_time_seconds: Option<f64>,
+        stones_left: Option<u32>,
+    ) {
+        let player = self.player_mut(color);
+        if let Some(seconds) = main_seconds {
+            player.main = Duration::from_secs_f64(seconds.max(0.0));
+        }
+        if let Some(periods) = periods_left {
+            player.periods_left = periods;
+        }
+        if let Some(period_secs) = period_time_seconds {
+            player.period_time = Duration::from_secs_f64(period_secs.max(0.0));
+        }
+        if let Some(stones) = stones_left {
+            player.stones_left = stones;
+        }
+    }
 }
 
 /// Formats a duration as `MM:SS`, or `H:MM:SS` when it is at least an hour.
@@ -464,5 +588,32 @@ mod tests {
         assert_eq!(clock.player(Color::White).main, Duration::from_millis(12_500));
         clock.set_main(Color::White, -3.0);
         assert_eq!(clock.player(Color::White).main, Duration::ZERO);
+    }
+
+    #[test]
+    fn sgf_time_control_roundtrips_all_variants() {
+        let variants = [
+            TimeControl::None,
+            TimeControl::Absolute { main: secs(600) },
+            TimeControl::Byoyomi {
+                main: secs(600),
+                periods: 5,
+                period: secs(30),
+            },
+            TimeControl::Fischer {
+                main: secs(300),
+                increment: secs(10),
+            },
+            TimeControl::Canadian {
+                main: secs(900),
+                stones: 25,
+                period: secs(300),
+            },
+        ];
+        for tc in variants {
+            let (tm, ot) = tc.to_sgf_fields();
+            let parsed = TimeControl::from_sgf_fields(tm, ot.as_deref());
+            assert_eq!(parsed, tc);
+        }
     }
 }

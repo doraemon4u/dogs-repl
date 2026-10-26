@@ -27,7 +27,11 @@ pub enum UserCommand {
     ChallengeDecline(i64),
     OpenGame(u64),
     CloseGame,
+    BoardSize(u8),
     LoadSgf(u64),
+    LoadSgfFile(String),
+    SaveSgfFile(String),
+    Step(StepCommand),
     Coordinate(Coord),
     Pass,
     Resign,
@@ -50,6 +54,15 @@ pub enum UserCommand {
     Focus(String),
     Unknown(String),
     Invalid(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepCommand {
+    Prev(u16),
+    Next(u16),
+    First,
+    Last,
+    Goto(u16),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,10 +192,30 @@ pub fn parse(input: &str) -> UserCommand {
             |id| UserCommand::OpenGame(id as u64),
         ),
         "close" | "leave" => UserCommand::CloseGame,
-        "sgf" => parse_id(parts.get(1)).map_or_else(
-            || UserCommand::Invalid("usage: sgf <game_id>".into()),
-            |id| UserCommand::LoadSgf(id as u64),
-        ),
+        "sgf" => parse_sgf(input, &parts),
+        "step" => parse_step(&parts),
+        "prev" | "back" => {
+            let count = parts
+                .get(1)
+                .and_then(|n| n.parse::<u16>().ok())
+                .unwrap_or(1)
+                .max(1);
+            UserCommand::Step(StepCommand::Prev(count))
+        }
+        "next" | "forward" => {
+            let count = parts
+                .get(1)
+                .and_then(|n| n.parse::<u16>().ok())
+                .unwrap_or(1)
+                .max(1);
+            UserCommand::Step(StepCommand::Next(count))
+        }
+        "first" | "start" => UserCommand::Step(StepCommand::First),
+        "last" | "end" | "live" => UserCommand::Step(StepCommand::Last),
+        "goto" => match parts.get(1).and_then(|n| n.parse::<u16>().ok()) {
+            Some(move_number) => UserCommand::Step(StepCommand::Goto(move_number)),
+            None => UserCommand::Invalid("usage: goto <move_number>".into()),
+        },
         "pass" => UserCommand::Pass,
         "resign" => UserCommand::Resign,
         "undo" => parse_undo(&parts),
@@ -190,10 +223,20 @@ pub fn parse(input: &str) -> UserCommand {
             Some(text) if !text.is_empty() => UserCommand::Chat(text.to_string()),
             _ => UserCommand::Invalid("usage: chat <message>".into()),
         },
-        "join" => parse_channel(parts.get(1), "join"),
+        "join" | "channel" => parse_channel(parts.get(1), keyword.as_str()),
         "part" | "leavechannel" => parse_channel(parts.get(1), "part"),
-        "channels" => UserCommand::Channels,
+        "channels" => match parts.get(1) {
+            None => UserCommand::Channels,
+            Some(&"list") => UserCommand::Channels,
+            Some(&"join") | Some(&"enter") => parse_channel(parts.get(2), "join"),
+            Some(&"part") | Some(&"leave") => parse_channel(parts.get(2), "part"),
+            Some(ch) => UserCommand::match_channel("join", ch.trim_start_matches('#')),
+        },
         "world" => parse_channel(parts.get(1), "world"),
+        "size" | "board" | "new" => match parts.get(1).and_then(|raw| raw.parse::<u8>().ok()) {
+            Some(size) if [9, 13, 19].contains(&size) => UserCommand::BoardSize(size),
+            _ => UserCommand::Invalid("usage: size <9|13|19> (supported board sizes: 9, 13, 19)".into()),
+        },
         "estimate" | "est" => match parts.get(1).map(|value| value.to_ascii_lowercase()) {
             None => UserCommand::Estimate(EstimateCommand::Enter),
             Some(action) => match action.as_str() {
@@ -242,6 +285,90 @@ pub fn parse(input: &str) -> UserCommand {
     }
 }
 
+fn parse_sgf(input: &str, parts: &[&str]) -> UserCommand {
+    let Some(first) = parts.get(1) else {
+        return UserCommand::Invalid(
+            "usage: sgf <game_id> | sgf load <path> | sgf save <path>".into(),
+        );
+    };
+    match first.to_ascii_lowercase().as_str() {
+        "load" | "open" | "import" => {
+            let path = rest_after(input, parts[0])
+                .and_then(|rest| rest_after(rest, parts[1]))
+                .map(str::trim)
+                .unwrap_or_default();
+            if path.is_empty() {
+                UserCommand::Invalid("usage: sgf load <path>".into())
+            } else {
+                UserCommand::LoadSgfFile(path.to_string())
+            }
+        }
+        "save" | "export" | "write" => {
+            let path = rest_after(input, parts[0])
+                .and_then(|rest| rest_after(rest, parts[1]))
+                .map(str::trim)
+                .unwrap_or_default();
+            if path.is_empty() {
+                UserCommand::Invalid("usage: sgf save <path>".into())
+            } else {
+                UserCommand::SaveSgfFile(path.to_string())
+            }
+        }
+        _ => {
+            if let Some(id) = parse_id(Some(first)).filter(|&id| id > 0) {
+                UserCommand::LoadSgf(id as u64)
+            } else if first.ends_with(".sgf") || first.contains('/') || first.contains('\\') {
+                let path = rest_after(input, parts[0]).map(str::trim).unwrap_or(first);
+                UserCommand::LoadSgfFile(path.to_string())
+            } else {
+                UserCommand::Invalid(
+                    "usage: sgf <game_id> | sgf load <path> | sgf save <path>".into(),
+                )
+            }
+        }
+    }
+}
+
+fn parse_step(parts: &[&str]) -> UserCommand {
+    let Some(arg) = parts.get(1) else {
+        return UserCommand::Step(StepCommand::Next(1));
+    };
+    match arg.to_ascii_lowercase().as_str() {
+        "prev" | "back" | "-1" => {
+            let count = parts
+                .get(2)
+                .and_then(|n| n.parse::<u16>().ok())
+                .unwrap_or(1)
+                .max(1);
+            UserCommand::Step(StepCommand::Prev(count))
+        }
+        "next" | "forward" | "+1" => {
+            let count = parts
+                .get(2)
+                .and_then(|n| n.parse::<u16>().ok())
+                .unwrap_or(1)
+                .max(1);
+            UserCommand::Step(StepCommand::Next(count))
+        }
+        "first" | "start" => UserCommand::Step(StepCommand::First),
+        "last" | "end" | "live" => UserCommand::Step(StepCommand::Last),
+        other => match other.parse::<i32>() {
+            Ok(delta) if arg.starts_with('-') => {
+                UserCommand::Step(StepCommand::Prev(delta.unsigned_abs() as u16))
+            }
+            Ok(delta) if arg.starts_with('+') => {
+                UserCommand::Step(StepCommand::Next(delta.unsigned_abs() as u16))
+            }
+            Ok(move_number) if move_number >= 0 => {
+                UserCommand::Step(StepCommand::Goto(move_number as u16))
+            }
+            _ => UserCommand::Invalid(
+                "usage: step [prev [n] | next [n] | first | last | <move_number>]".into(),
+            ),
+        },
+    }
+}
+
 fn parse_id(token: Option<&&str>) -> Option<i64> {
     token.and_then(|token| token.trim_start_matches('#').parse::<i64>().ok())
 }
@@ -259,7 +386,7 @@ impl UserCommand {
             return UserCommand::Invalid(format!("usage: {command} <channel>"));
         }
         match command {
-            "join" => Self::Join(channel.to_string()),
+            "join" | "channel" => Self::Join(channel.to_string()),
             "part" => Self::Part(channel.to_string()),
             _ => Self::World(channel.to_string()),
         }
@@ -506,14 +633,15 @@ pub fn help_text() -> &'static str {
     "OGS commands
   login <user> [password] | logout | connect | refresh | whoami
   lobby | games | challenges | player <name|id> | notifications
-  game <id> | close | sgf <id>
+  game <id> | close | size <9|13|19> | sgf <id> | sgf load <path> | sgf save <path>
+  step [prev|next|first|last|<move>] | prev [n] | next [n] | first | last | goto <move>
   [a10] | play D4 | pass | resign | undo [request|accept|decline] [move]
-  chat <text> | join <channel> | part <channel> | channels | world <channel>
+  chat <text> | channels [channel] | join <channel> | part <channel> | world <channel>
   challenge create --opponent <name> [--board 9|13|19] [--rules ...]
       [--ranked|--unranked] [--color black|white|automatic]
       [--time byoyomi|fischer|absolute] [--main s] [--period s] [--periods n] [--increment s]
   challenge accept|decline <id>
-  estimate | estimate confirm | estimate exit
+  estimate | estimate auto | estimate confirm | estimate exit
   dead <coord>... | alive <coord>... | dame <coord>...
   score show | score accept | score reject
   focus <board|moves|chat|input> | clear | version | quit"
@@ -590,6 +718,66 @@ mod tests {
         assert_eq!(parse("g #42"), UserCommand::OpenGame(42));
         assert!(matches!(parse("game"), UserCommand::Invalid(_)));
         assert_eq!(parse("sgf 99"), UserCommand::LoadSgf(99));
+        assert_eq!(
+            parse("sgf load /tmp/test.sgf"),
+            UserCommand::LoadSgfFile("/tmp/test.sgf".into())
+        );
+        assert_eq!(
+            parse("sgf save /tmp/out.sgf"),
+            UserCommand::SaveSgfFile("/tmp/out.sgf".into())
+        );
+        assert_eq!(
+            parse("sgf game.sgf"),
+            UserCommand::LoadSgfFile("game.sgf".into())
+        );
+    }
+
+    #[test]
+    fn parses_step_and_navigation_commands() {
+        assert_eq!(
+            parse("step"),
+            UserCommand::Step(StepCommand::Next(1))
+        );
+        assert_eq!(
+            parse("step prev 3"),
+            UserCommand::Step(StepCommand::Prev(3))
+        );
+        assert_eq!(
+            parse("step next 2"),
+            UserCommand::Step(StepCommand::Next(2))
+        );
+        assert_eq!(
+            parse("step first"),
+            UserCommand::Step(StepCommand::First)
+        );
+        assert_eq!(
+            parse("step last"),
+            UserCommand::Step(StepCommand::Last)
+        );
+        assert_eq!(
+            parse("step 15"),
+            UserCommand::Step(StepCommand::Goto(15))
+        );
+        assert_eq!(
+            parse("prev 2"),
+            UserCommand::Step(StepCommand::Prev(2))
+        );
+        assert_eq!(
+            parse("next"),
+            UserCommand::Step(StepCommand::Next(1))
+        );
+        assert_eq!(
+            parse("first"),
+            UserCommand::Step(StepCommand::First)
+        );
+        assert_eq!(
+            parse("last"),
+            UserCommand::Step(StepCommand::Last)
+        );
+        assert_eq!(
+            parse("goto 8"),
+            UserCommand::Step(StepCommand::Goto(8))
+        );
     }
 
     #[test]
@@ -722,8 +910,15 @@ mod tests {
     #[test]
     fn parses_channels_and_score() {
         assert_eq!(parse("join #en"), UserCommand::Join("en".into()));
+        assert_eq!(parse("channels #zh"), UserCommand::Join("zh".into()));
+        assert_eq!(parse("channels join ja"), UserCommand::Join("ja".into()));
+        assert_eq!(parse("channel ko"), UserCommand::Join("ko".into()));
         assert_eq!(parse("part zh"), UserCommand::Part("zh".into()));
         assert_eq!(parse("world ja"), UserCommand::World("ja".into()));
+        assert_eq!(parse("size 9"), UserCommand::BoardSize(9));
+        assert_eq!(parse("board 13"), UserCommand::BoardSize(13));
+        assert_eq!(parse("new 19"), UserCommand::BoardSize(19));
+        assert!(matches!(parse("size 10"), UserCommand::Invalid(_)));
         assert_eq!(parse("score"), UserCommand::Score(ScoreCommand::Show));
         assert_eq!(
             parse("score accept"),
@@ -750,3 +945,4 @@ mod tests {
         assert_eq!(prompt(Some(42), true), "ogs[42|estimate]> ");
     }
 }
+

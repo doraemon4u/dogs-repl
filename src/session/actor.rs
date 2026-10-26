@@ -11,6 +11,7 @@ use crate::config::{self, StoredCredentials};
 use crate::engine::board::Color;
 use crate::engine::coord::Coord;
 use crate::engine::sgf::SgfGame;
+use crate::session::event_bus::EventBus;
 use crate::session::store::{
     apply_clock_update, apply_removed_stones, game_channel, game_view_from_json,
     notification_text, parse_ogs_coord, GameView, LogLevel, NotificationItem, Store,
@@ -18,6 +19,7 @@ use crate::session::store::{
 use crate::transport::auth::{self, AuthSession};
 use crate::transport::realtime_client::{GameList, RealtimeClient, RealtimeEvent};
 use crate::transport::rest_client::{ChallengeOptions, RestClient};
+use crate::ui::commands::StepCommand;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
@@ -67,7 +69,22 @@ pub enum Command {
     FetchChannels,
     OpenGame(u64),
     CloseGame(u64),
+    SetBoardSize {
+        game_id: Option<u64>,
+        size: u8,
+    },
     LoadSgf(u64),
+    LoadSgfFile {
+        path: String,
+    },
+    SaveSgfFile {
+        game_id: u64,
+        path: String,
+    },
+    StepGame {
+        game_id: u64,
+        step: StepCommand,
+    },
     LoadMyGames,
     LoadChallenges,
     PlayMove {
@@ -103,6 +120,9 @@ pub enum Command {
         game_id: u64,
     },
     EstimateConfirm {
+        game_id: u64,
+    },
+    EstimateAuto {
         game_id: u64,
     },
     ToggleEstimateDead {
@@ -180,6 +200,7 @@ pub struct Bootstrap {
 pub struct SessionHandle {
     state: Arc<RwLock<Store>>,
     tx: mpsc::UnboundedSender<Command>,
+    event_bus: Arc<EventBus>,
 }
 
 impl SessionHandle {
@@ -192,12 +213,14 @@ impl SessionHandle {
     /// Starts the actor with a pre-populated store (tests, replay fixtures).
     pub fn spawn_with_store(config: SessionConfig, store: Store) -> Self {
         let state = Arc::new(RwLock::new(store));
+        let event_bus = EventBus::new();
         let (tx, rx) = mpsc::unbounded_channel();
         let actor = Actor {
             state: Arc::clone(&state),
             tx: tx.clone(),
             rx,
             config,
+            event_bus: Arc::clone(&event_bus),
             auth: None,
             rest: None,
             realtime: None,
@@ -207,7 +230,11 @@ impl SessionHandle {
             tick_count: 0,
         };
         tokio::spawn(actor.run());
-        Self { state, tx }
+        Self {
+            state,
+            tx,
+            event_bus,
+        }
     }
 
     pub fn send(&self, command: Command) {
@@ -220,6 +247,11 @@ impl SessionHandle {
     /// Read access for rendering. Callers must not hold the lock across awaits.
     pub fn state(&self) -> Arc<RwLock<Store>> {
         Arc::clone(&self.state)
+    }
+
+    /// Access to the session event bus for subscribing to Realtime and Session events.
+    pub fn event_bus(&self) -> Arc<EventBus> {
+        Arc::clone(&self.event_bus)
     }
 
     pub async fn snapshot(&self) -> Store {
@@ -257,6 +289,7 @@ struct Actor {
     tx: mpsc::UnboundedSender<Command>,
     rx: mpsc::UnboundedReceiver<Command>,
     config: SessionConfig,
+    event_bus: Arc<EventBus>,
     auth: Option<AuthSession>,
     rest: Option<Arc<RestClient>>,
     realtime: Option<Arc<RealtimeClient>>,
@@ -305,20 +338,42 @@ impl Actor {
                 if let Some(realtime) = &self.realtime {
                     realtime.chat_join(&channel);
                 }
-                self.state
-                    .write()
-                    .await
-                    .set_channel_joined(&channel, true);
-                self.log(LogLevel::Info, format!("joined #{channel}")).await;
+                {
+                    let mut state = self.state.write().await;
+                    state.set_channel_joined(&channel, true);
+                    state.set_world_channel(&channel);
+                }
+                self.log(
+                    LogLevel::Success,
+                    format!("joined and entered #{channel}"),
+                )
+                .await;
             }
             Command::PartChannel(channel) => {
                 if let Some(realtime) = &self.realtime {
                     realtime.chat_part(&channel);
                 }
-                self.state
-                    .write()
-                    .await
-                    .set_channel_joined(&channel, false);
+                {
+                    let mut state = self.state.write().await;
+                    state.set_channel_joined(&channel, false);
+                    let leaving_current = matches!(
+                        &state.chat_scope,
+                        crate::session::store::ChatScope::World { channel: active } if active == &channel
+                    );
+                    if leaving_current {
+                        if let Some(game_id) = state.active_game {
+                            state.set_chat_scope(crate::session::store::ChatScope::game(game_id));
+                        } else {
+                            let fallback = state
+                                .channels
+                                .iter()
+                                .find(|(name, ch)| *name != &channel && ch.joined && !name.starts_with("game/"))
+                                .map(|(name, _)| name.clone())
+                                .unwrap_or_else(|| self.config.world_channel.clone());
+                            state.set_world_channel(&fallback);
+                        }
+                    }
+                }
                 self.log(LogLevel::Info, format!("left #{channel}")).await;
             }
             Command::SetWorldChannel(channel) => self.set_world_channel(channel).await,
@@ -332,7 +387,35 @@ impl Actor {
             Command::FetchChannels => self.spawn_channels(),
             Command::OpenGame(game_id) => self.open_game(game_id).await,
             Command::CloseGame(game_id) => self.close_game(game_id).await,
+            Command::SetBoardSize { game_id, size } => {
+                if ![9u8, 13, 19].contains(&size) {
+                    self.log(
+                        LogLevel::Error,
+                        format!("invalid board size {size}; supported sizes are 9, 13, 19"),
+                    )
+                    .await;
+                } else {
+                    let target_id = {
+                        let mut state = self.state.write().await;
+                        let id = game_id
+                            .or(state.active_game)
+                            .unwrap_or(42);
+                        let view = GameView::empty(id, size);
+                        state.games.insert(id, view);
+                        state.switch_to_game(id);
+                        id
+                    };
+                    self.log(
+                        LogLevel::Success,
+                        format!("game {target_id}: board size set to {size}x{size} (standard Go rules active)"),
+                    )
+                    .await;
+                }
+            }
             Command::LoadSgf(game_id) => self.spawn_sgf(game_id),
+            Command::LoadSgfFile { path } => self.load_sgf_file(path).await,
+            Command::SaveSgfFile { game_id, path } => self.save_sgf_file(game_id, path).await,
+            Command::StepGame { game_id, step } => self.step_game(game_id, step).await,
             Command::LoadMyGames => self.spawn_my_games(),
             Command::LoadChallenges => self.spawn_challenges(),
             Command::PlayMove { game_id, coord } => {
@@ -415,7 +498,7 @@ impl Actor {
                     self.log(
                         LogLevel::Info,
                         format!(
-                            "estimate mode: type [a10] to toggle a group, `estimate confirm` to count, `estimate exit` to leave{}",
+                            "estimate mode: type [a10] to toggle a group, `estimate auto` for Monte-Carlo, `estimate confirm` to count, `estimate exit` to leave{}",
                             summary
                                 .map(|summary| format!(" (current: {summary})"))
                                 .unwrap_or_default()
@@ -437,6 +520,7 @@ impl Actor {
                 self.log(LogLevel::Info, "estimate mode exited").await;
             }
             Command::EstimateConfirm { game_id } => self.estimate_confirm(game_id).await,
+            Command::EstimateAuto { game_id } => self.estimate_auto(game_id).await,
             Command::ToggleEstimateDead { game_id, coord } => {
                 let mut state = self.state.write().await;
                 if let Some(game) = state.game_mut(game_id) {
@@ -685,13 +769,19 @@ impl Actor {
     }
 
     async fn play_move(&mut self, game_id: u64, coord: Coord) {
-        let (size, phase, to_play) = {
+        let validation = {
             let state = self.state.read().await;
             match state.game(game_id) {
-                Some(game) => (game.size, game.phase, Some(game.to_play())),
-                None => (19, crate::session::store::GamePhase::Play, None),
+                Some(game) => (
+                    game.size,
+                    game.phase,
+                    Some(game.to_play()),
+                    Some(game.validate_move(coord)),
+                ),
+                None => (19, crate::session::store::GamePhase::Play, None, None),
             }
         };
+        let (size, phase, to_play, rule_check) = validation;
         if !coord.is_on_board(size) {
             self.log(
                 LogLevel::Error,
@@ -708,7 +798,24 @@ impl Actor {
             .await;
             return;
         }
+        if let Some(Err(rule_err)) = rule_check {
+            self.log(
+                LogLevel::Error,
+                format!("game {game_id}: illegal move {} — {rule_err}", coord.to_gtp()),
+            )
+            .await;
+            return;
+        }
         if let Some(realtime) = &self.realtime {
+            {
+                let mut state = self.state.write().await;
+                if let Some(game) = state.game_mut(game_id) {
+                    if let Some(cursor) = game.view_move {
+                        let _ = game.game.truncate_to(cursor);
+                        game.set_view_move(None);
+                    }
+                }
+            }
             realtime.play_move(game_id as i64, &coord.to_gtp());
             self.log(
                 LogLevel::Info,
@@ -720,7 +827,41 @@ impl Actor {
             )
             .await;
         } else {
-            self.offline_warning("play").await;
+            let local_outcome = {
+                let mut state = self.state.write().await;
+                state
+                    .game_mut(game_id)
+                    .map(|game| {
+                        let res = game.play_local_move(coord);
+                        let ko = game.ko_point().map(|(c, r)| Coord::new(c, r).to_gtp());
+                        (res, game.move_number(), ko)
+                    })
+            };
+            match local_outcome {
+                Some((Ok(color), move_no, ko)) => {
+                    let ko_note = ko
+                        .map(|pt| format!(" [ko point at {pt}]"))
+                        .unwrap_or_default();
+                    self.log(
+                        LogLevel::Success,
+                        format!(
+                            "game {game_id}: move #{move_no} {color:?} played {}{ko_note}",
+                            coord.to_gtp()
+                        ),
+                    )
+                    .await;
+                }
+                Some((Err(err), _, _)) => {
+                    self.log(
+                        LogLevel::Error,
+                        format!("game {game_id}: illegal move {} — {err}", coord.to_gtp()),
+                    )
+                    .await;
+                }
+                None => {
+                    self.offline_warning("play").await;
+                }
+            }
         }
     }
 
@@ -821,7 +962,144 @@ impl Actor {
         .await;
     }
 
+    // --------------------------------------------------- sgf & review cursor
+
+    async fn load_sgf_file(&mut self, path: String) {
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.log(
+                    LogLevel::Error,
+                    format!("could not read SGF file '{path}': {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let sgf = match SgfGame::parse(&raw) {
+            Ok(sgf) => sgf,
+            Err(error) => {
+                self.log(
+                    LogLevel::Error,
+                    format!("invalid SGF in '{path}': {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+        let game_id = {
+            let state = self.state.read().await;
+            state
+                .active_game
+                .unwrap_or_else(|| state.games.keys().next_back().copied().unwrap_or(9000) + 1)
+        };
+        match GameView::from_sgf_game(game_id, &sgf) {
+            Ok(view) => {
+                let moves = view.move_number();
+                let title = view.title();
+                {
+                    let mut state = self.state.write().await;
+                    state.games.insert(game_id, view);
+                    state.switch_to_game(game_id);
+                }
+                self.log(
+                    LogLevel::Success,
+                    format!("loaded SGF '{path}' into game {game_id} ({moves} moves: {title})"),
+                )
+                .await;
+            }
+            Err(error) => {
+                self.log(
+                    LogLevel::Error,
+                    format!("SGF replay failed for '{path}': {error}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn save_sgf_file(&mut self, game_id: u64, path: String) {
+        let sgf_text = {
+            let state = self.state.read().await;
+            match state.game(game_id) {
+                Some(game) => game.to_sgf_game().to_sgf(),
+                None => {
+                    drop(state);
+                    self.log(LogLevel::Warning, format!("game {game_id} is not open"))
+                        .await;
+                    return;
+                }
+            }
+        };
+        match std::fs::write(&path, sgf_text) {
+            Ok(()) => {
+                self.log(
+                    LogLevel::Success,
+                    format!("saved game {game_id} to '{path}'"),
+                )
+                .await;
+            }
+            Err(error) => {
+                self.log(
+                    LogLevel::Error,
+                    format!("could not write SGF file '{path}': {error}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn step_game(&mut self, game_id: u64, step: StepCommand) {
+        let outcome = {
+            let mut state = self.state.write().await;
+            let Some(game) = state.game_mut(game_id) else {
+                drop(state);
+                self.log(LogLevel::Warning, format!("game {game_id} is not open"))
+                    .await;
+                return;
+            };
+            let current = match step {
+                StepCommand::Prev(count) => game.step_view(-(i32::from(count))),
+                StepCommand::Next(count) => game.step_view(i32::from(count)),
+                StepCommand::First => game.set_view_move(Some(0)),
+                StepCommand::Last => game.set_view_move(None),
+                StepCommand::Goto(target) => game.set_view_move(Some(target)),
+            };
+            (current, game.move_number(), game.is_reviewing())
+        };
+        let (current, total, reviewing) = outcome;
+        let label = if reviewing {
+            format!("game {game_id}: reviewing move {current}/{total} (`last` returns to live)")
+        } else {
+            format!("game {game_id}: at latest move {total}")
+        };
+        self.log(LogLevel::Info, label).await;
+    }
+
     // ----------------------------------------------------------- estimate
+
+    async fn estimate_auto(&mut self, game_id: u64) {
+        let outcome = {
+            let mut state = self.state.write().await;
+            let Some(game) = state.game_mut(game_id) else {
+                drop(state);
+                self.log(LogLevel::Warning, format!("game {game_id} is not open"))
+                    .await;
+                return;
+            };
+            let summary = game.auto_estimate();
+            let dead = game.estimate_dead.len();
+            (summary, dead)
+        };
+        let (summary, dead) = outcome;
+        self.log(
+            LogLevel::Success,
+            format!(
+                "Monte-Carlo auto estimate: {summary} ({dead} dead stone(s) detected; toggle groups with [a10] or `estimate confirm`)"
+            ),
+        )
+        .await;
+    }
 
     async fn estimate_confirm(&mut self, game_id: u64) {
         let summary = {
@@ -958,6 +1236,7 @@ impl Actor {
                     state.connection = crate::session::store::ConnectionState::Connected;
                     state.connection_message = None;
                 }
+                self.event_bus.publish("connected", &Value::Null).await;
                 self.log(LogLevel::Info, "realtime socket connected").await;
                 self.join_world_channel().await;
             }
@@ -967,6 +1246,7 @@ impl Actor {
                     state.connection = crate::session::store::ConnectionState::Connecting;
                     state.connection_message = Some("socket disconnected; reconnecting".into());
                 }
+                self.event_bus.publish("disconnected", &Value::Null).await;
                 self.log(LogLevel::Warning, "realtime socket disconnected; reconnecting").await;
             }
             RealtimeEvent::Authenticated { user_id, username } => {
@@ -981,6 +1261,12 @@ impl Actor {
                         state.username = Some(username.clone());
                     }
                 }
+                self.event_bus
+                    .publish(
+                        "authenticated",
+                        &json!({"user_id": user_id, "username": username}),
+                    )
+                    .await;
                 self.log(
                     LogLevel::Success,
                     format!("socket authenticated as {username} ({user_id})"),
@@ -998,8 +1284,11 @@ impl Actor {
                 }
                 self.spawn_overview();
             }
-            RealtimeEvent::Heartbeat => {}
+            RealtimeEvent::Heartbeat => {
+                self.event_bus.publish("net/pong", &Value::Null).await;
+            }
             RealtimeEvent::HostInfo(info) => {
+                self.event_bus.publish("hostinfo", &info).await;
                 let version = info
                     .get("version")
                     .and_then(Value::as_str)
@@ -1008,6 +1297,7 @@ impl Actor {
                     .await;
             }
             RealtimeEvent::Notification(note) => {
+                self.event_bus.publish("notification", &note).await;
                 let text = notification_text(&note);
                 let id = note
                     .get("id")
@@ -1026,6 +1316,7 @@ impl Actor {
                     .await;
             }
             RealtimeEvent::ActiveGame(game) => {
+                self.event_bus.publish("active_game", &game).await;
                 let id = game
                     .get("game_id")
                     .or_else(|| game.get("id"))
@@ -1037,6 +1328,9 @@ impl Actor {
                 }
             }
             RealtimeEvent::GameListCount { list, count } => {
+                self.event_bus
+                    .publish("gamelist/count", &json!({"list": list, "count": count}))
+                    .await;
                 self.state
                     .write()
                     .await
@@ -1048,9 +1342,16 @@ impl Actor {
                 author,
                 text,
             } => {
+                self.event_bus
+                    .publish(
+                        "chat-message",
+                        &json!({"channel": channel, "author": author, "text": text}),
+                    )
+                    .await;
                 self.state.write().await.push_chat(&channel, &author, &text);
             }
             RealtimeEvent::GameEvent { event, data } => {
+                self.event_bus.publish(&event, &data).await;
                 self.handle_game_event(&event, data).await;
             }
             RealtimeEvent::Response {
@@ -1059,9 +1360,13 @@ impl Actor {
                 error,
                 ..
             } => {
+                self.event_bus.publish(&command, &data).await;
                 self.handle_response(&command, data, error).await;
             }
             RealtimeEvent::Error(message) => {
+                self.event_bus
+                    .publish("error", &json!({"message": message}))
+                    .await;
                 self.state
                     .write()
                     .await
@@ -1550,6 +1855,7 @@ impl Actor {
             }
         }
 
+        let had_rest = from_rest.is_some();
         let mut view = from_rest.unwrap_or_else(|| GameView::empty(game_id, 19));
         if let Some(meta) = sgf_game {
             match meta.replay_game() {
@@ -1557,7 +1863,21 @@ impl Actor {
                     view.id = game_id;
                     view.size = game.size();
                     view.game = game;
-                    view.clock.set_active(Some(view.game.to_play()));
+                    if !had_rest {
+                        view.komi = meta.komi;
+                        if let Some(rules) = &meta.rules {
+                            view.rules = rules.to_ascii_lowercase();
+                        }
+                        if view.result.is_none() {
+                            view.result = meta.result.clone();
+                        }
+                        view.clock = crate::engine::clock::Clock::new(
+                            meta.time_control(),
+                            Some(view.game.to_play()),
+                        );
+                    } else {
+                        view.clock.set_active(Some(view.game.to_play()));
+                    }
                     if view.black == "Black" {
                         if let Some(name) = &meta.player_black {
                             view.black = name.clone();
@@ -1993,4 +2313,74 @@ mod tests {
         assert_eq!(GamePhase::from_ogs("FINISHED"), GamePhase::Finished);
         assert_eq!(GamePhase::from_ogs("play"), GamePhase::Play);
     }
+
+    #[tokio::test]
+    async fn realtime_events_are_published_to_event_bus() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let handle = SessionHandle::spawn_with_store(config(), store_with_game());
+        let received = Arc::new(AtomicUsize::new(0));
+        let received_clone = Arc::clone(&received);
+        handle
+            .event_bus()
+            .subscribe(
+                "chat-message",
+                Arc::new(move |_event, data| {
+                    if data.get("text").and_then(Value::as_str) == Some("bus hello") {
+                        received_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            )
+            .await;
+
+        handle.send(Command::Internal(Internal::Realtime(RealtimeEvent::Chat {
+            channel: "en".into(),
+            author: "alice".into(),
+            text: "bus hello".into(),
+        })));
+
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| {
+                    store
+                        .channels
+                        .get("en")
+                        .map(|ch| ch.messages.len() == 1)
+                        .unwrap_or(false)
+                })
+                .await
+        );
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn estimate_auto_and_step_game_commands_work() {
+        let handle = SessionHandle::spawn_with_store(config(), store_with_game());
+        handle.send(Command::EstimateAuto { game_id: 42 });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| {
+                    store
+                        .game(42)
+                        .map(|g| g.estimate_active && g.estimate_summary.is_some())
+                        .unwrap_or(false)
+                })
+                .await
+        );
+
+        handle.send(Command::StepGame {
+            game_id: 42,
+            step: StepCommand::Prev(1),
+        });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| {
+                    store
+                        .game(42)
+                        .map(|g| g.displayed_move_number() == 1 && g.is_reviewing())
+                        .unwrap_or(false)
+                })
+                .await
+        );
+    }
 }
+

@@ -345,6 +345,234 @@ pub fn toggle_dead_group(
     true
 }
 
+/// Default number of Monte-Carlo endgame playouts for automatic dead-stone detection.
+pub const DEFAULT_PLAYOUTS: usize = 64;
+
+/// Survival probability threshold below which a stone group is classified as dead.
+const DEAD_SURVIVAL_THRESHOLD: f64 = 0.36;
+
+/// Automatically detects dead stones using Monte-Carlo random endgame playouts
+/// (design §10.2, modelled after `goban`'s Monte-Carlo estimator).
+///
+/// The simulation is pure Engine code (no I/O, deterministic seed derived from
+/// the board position) and protects single-point true eyes during playouts so
+/// live two-eyed groups stay alive while isolated/dead stones inside opponent
+/// territory are captured.
+pub fn auto_detect_dead(board: &Board, playouts: usize) -> HashSet<(u8, u16)> {
+    let size = board.size();
+    if size == 0 || board.stone_count() == 0 {
+        return HashSet::new();
+    }
+    let playouts = playouts.max(8);
+    let n = size as usize;
+    let mut black_owned = vec![vec![0usize; n]; n];
+    let mut white_owned = vec![vec![0usize; n]; n];
+    let mut rng = Xorshift64::from_board(board);
+
+    for i in 0..playouts {
+        let start_color = if i % 2 == 0 {
+            Color::Black
+        } else {
+            Color::White
+        };
+        let sim = run_playout(board, start_color, &mut rng);
+        let territory = estimate_territory(&sim);
+        for row in 1..=size as u16 {
+            let r_idx = (size as u16 - row) as usize;
+            for col in 0..size {
+                let c_idx = col as usize;
+                match territory[r_idx][c_idx] {
+                    PointEstimate::LiveStone(Color::Black) | PointEstimate::BlackTerritory => {
+                        black_owned[r_idx][c_idx] += 1;
+                    }
+                    PointEstimate::LiveStone(Color::White) | PointEstimate::WhiteTerritory => {
+                        white_owned[r_idx][c_idx] += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut dead = HashSet::new();
+    let mut visited = HashSet::new();
+
+    for row in 1..=size as u16 {
+        for col in 0..size {
+            let Some(color) = board.get(col, row) else {
+                continue;
+            };
+            if visited.contains(&(col, row)) {
+                continue;
+            }
+            let group = connected_stone_group(board, (col, row));
+            for &pt in &group {
+                visited.insert(pt);
+            }
+
+            let mut survival_sum = 0.0;
+            for &(gc, gr) in &group {
+                let r_idx = (size as u16 - gr) as usize;
+                let c_idx = gc as usize;
+                let owned = match color {
+                    Color::Black => black_owned[r_idx][c_idx],
+                    Color::White => white_owned[r_idx][c_idx],
+                };
+                survival_sum += owned as f64 / playouts as f64;
+            }
+            let avg_survival = survival_sum / group.len() as f64;
+            if avg_survival < DEAD_SURVIVAL_THRESHOLD {
+                for pt in group {
+                    dead.insert(pt);
+                }
+            }
+        }
+    }
+
+    dead
+}
+
+/// Runs a single light playout until neither player has a non-eye legal move.
+fn run_playout(board: &Board, start_color: Color, rng: &mut Xorshift64) -> Board {
+    let mut sim = board.clone();
+    let size = sim.size();
+    let max_steps = (size as usize) * (size as usize) * 2 + 16;
+    let mut color = start_color;
+    let mut ko_point: Option<(u8, u16)> = None;
+    let mut consecutive_passes = 0u8;
+
+    let mut empty_points: Vec<(u8, u16)> = Vec::with_capacity((size as usize) * (size as usize));
+
+    for _ in 0..max_steps {
+        empty_points.clear();
+        for row in 1..=size as u16 {
+            for col in 0..size {
+                if sim.is_empty(col, row) {
+                    empty_points.push((col, row));
+                }
+            }
+        }
+
+        // Shuffle candidate order with Fisher-Yates so the first legal non-eye
+        // move is chosen uniformly, while preferring immediate captures when available.
+        let len = empty_points.len();
+        for idx in 0..len {
+            let swap_idx = idx + (rng.next_u64() as usize % (len - idx));
+            empty_points.swap(idx, swap_idx);
+        }
+
+        let mut chosen: Option<(u8, u16)> = None;
+        for &(col, row) in &empty_points {
+            if is_true_eye(&sim, col, row, color) {
+                continue;
+            }
+            if let Ok(captures) = rules::validate_move(&sim, col, row, color, ko_point) {
+                if captures > 0 {
+                    chosen = Some((col, row));
+                    break;
+                }
+                if chosen.is_none() {
+                    chosen = Some((col, row));
+                }
+            }
+        }
+
+        if let Some((col, row)) = chosen {
+            let captured = rules::execute_move(&mut sim, col, row, color);
+            ko_point = if captured.len() == 1 {
+                let group = rules::collect_group(&sim, col, row);
+                if group.len() == 1 && rules::count_liberties(&sim, &group) == 1 {
+                    Some(captured[0])
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            consecutive_passes = 0;
+        } else {
+            ko_point = None;
+            consecutive_passes += 1;
+            if consecutive_passes >= 2 {
+                break;
+            }
+        }
+        color = color.opponent();
+    }
+
+    sim
+}
+
+/// Checks whether `(col, row)` is a single-point eye for `color` that should
+/// not be self-filled during a playout.
+fn is_true_eye(board: &Board, col: u8, row: u16, color: Color) -> bool {
+    let neighbors = board.neighbors(col, row);
+    if neighbors.is_empty() {
+        return false;
+    }
+    for &(nc, nr) in &neighbors {
+        if board.get(nc, nr) != Some(color) {
+            return false;
+        }
+    }
+
+    let size = board.size() as i16;
+    let deltas: [(i16, i16); 4] = [(-1, -1), (-1, 1), (1, -1), (1, 1)];
+    let mut diag_total = 0usize;
+    let mut friendly_diag = 0usize;
+    for (dc, dr) in deltas {
+        let nc = col as i16 + dc;
+        let nr = row as i16 + dr;
+        if nc >= 0 && nc < size && nr >= 1 && nr <= size {
+            diag_total += 1;
+            if board.get(nc as u8, nr as u16) == Some(color) {
+                friendly_diag += 1;
+            }
+        }
+    }
+
+    if diag_total == 4 {
+        friendly_diag >= 3
+    } else {
+        friendly_diag == diag_total
+    }
+}
+
+/// Small deterministic PRNG seeded from a board position.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn from_board(board: &Board) -> Self {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325 ^ (board.size() as u64);
+        for row in 1..=board.size() as u16 {
+            for col in 0..board.size() {
+                let code: u64 = match board.get(col, row) {
+                    None => 1,
+                    Some(Color::Black) => 2,
+                    Some(Color::White) => 3,
+                };
+                hash ^= code.wrapping_mul(((row as u64) << 8) ^ (col as u64));
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        if hash == 0 {
+            hash = 0x9e37_79b9_7f4a_7c15;
+        }
+        Self { state: hash }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -479,5 +707,40 @@ mod tests {
     fn connected_group_for_empty_points_is_empty() {
         let board = Board::new(9);
         assert!(connected_stone_group(&board, (4, 4)).is_empty());
+    }
+
+    #[test]
+    fn auto_detect_dead_marks_surrounded_dead_stone_and_keeps_live_wall() {
+        let mut board = Board::new(9);
+        // Black builds a two-eyed fortress in the bottom-left corner:
+        // Eyes at (0,1) and (2,1), surrounded by Black stones on rows 1..=3, cols 0..=3.
+        for col in 0..=3 {
+            for row in 1..=3 {
+                if (col == 0 && row == 1) || (col == 2 && row == 1) {
+                    continue;
+                }
+                board.place(col, row, Color::Black);
+            }
+        }
+        // Place a doomed White stone at (1, 5) tightly boxed in by Black stones
+        // with only a single liberty and no eye space.
+        board.place(1, 5, Color::White);
+        board.place(0, 5, Color::Black);
+        board.place(2, 5, Color::Black);
+        board.place(1, 4, Color::Black);
+        // Leave (1, 6) empty but surround (1, 6) with Black so White cannot escape.
+        board.place(0, 6, Color::Black);
+        board.place(2, 6, Color::Black);
+        board.place(1, 7, Color::Black);
+
+        let detected = auto_detect_dead(&board, DEFAULT_PLAYOUTS);
+        assert!(
+            detected.contains(&(1, 5)),
+            "doomed white stone should be detected as dead: {detected:?}"
+        );
+        assert!(
+            !detected.contains(&(1, 1)),
+            "two-eyed black fortress must remain alive: {detected:?}"
+        );
     }
 }

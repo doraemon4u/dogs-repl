@@ -247,12 +247,14 @@ fn field_line<'a>(label: &str, value: &str, focused: bool, theme: &Theme) -> Lin
     ])
 }
 
-/// A message overlay for help, version, notifications, or score details.
+/// A message or interactive channel-picker overlay.
 #[derive(Debug, Clone)]
 pub struct Overlay {
     pub title: String,
     pub lines: Vec<String>,
     pub scroll: u16,
+    pub selectable_channels: Vec<String>,
+    pub selected_index: usize,
 }
 
 impl Overlay {
@@ -263,10 +265,103 @@ impl Overlay {
             title: title.into(),
             lines,
             scroll: 0,
+            selectable_channels: Vec::new(),
+            selected_index: 0,
         }
     }
 
+    /// Creates an interactive channel selector overlay where Up/Down moves the cursor
+    /// and Enter joins and enters the selected channel.
+    pub fn channel_picker(store: &Store) -> Self {
+        let mut channels = store.available_channels.clone();
+        if channels.is_empty() {
+            channels = vec![
+                "en".into(),
+                "zh".into(),
+                "ja".into(),
+                "ko".into(),
+                "de".into(),
+                "fr".into(),
+                "es".into(),
+                "ru".into(),
+            ];
+        }
+        if !channels.contains(&store.world_channel) {
+            channels.insert(0, store.world_channel.clone());
+        }
+        let selected_index = channels
+            .iter()
+            .position(|c| c == &store.world_channel)
+            .unwrap_or(0);
+        let mut overlay = Self {
+            title: "Channels (↑/↓ select, Enter to join & enter, Esc to close)".into(),
+            lines: Vec::new(),
+            scroll: 0,
+            selectable_channels: channels,
+            selected_index,
+        };
+        overlay.rebuild_channel_lines(store);
+        overlay
+    }
+
+    pub fn rebuild_channel_lines(&mut self, store: &Store) {
+        if self.selectable_channels.is_empty() {
+            return;
+        }
+        let mut lines = vec![
+            format!("current world channel: #{}", store.world_channel),
+            "press ↑/↓ and Enter to enter a channel, or type `channels <name>` / `join <name>`:".into(),
+            String::new(),
+        ];
+        for (idx, channel) in self.selectable_channels.iter().enumerate() {
+            let joined = store
+                .channels
+                .get(channel)
+                .map(|state| state.joined)
+                .unwrap_or(false);
+            let unread = store
+                .channels
+                .get(channel)
+                .map(|state| state.unread)
+                .unwrap_or(0);
+            let cursor = if idx == self.selected_index { "▶ " } else { "  " };
+            let status = if channel == &store.world_channel {
+                " [active]"
+            } else if joined {
+                " (joined)"
+            } else {
+                ""
+            };
+            let unread_tag = if unread > 0 {
+                format!(" [{unread} new]")
+            } else {
+                String::new()
+            };
+            lines.push(format!("{cursor}#{channel}{status}{unread_tag}"));
+        }
+        self.lines = lines;
+    }
+
+    pub fn selected_channel(&self) -> Option<&str> {
+        self.selectable_channels
+            .get(self.selected_index)
+            .map(String::as_str)
+    }
+
     pub fn scroll_by(&mut self, delta: i32) {
+        if !self.selectable_channels.is_empty() {
+            let max_idx = self.selectable_channels.len().saturating_sub(1) as i32;
+            self.selected_index = (self.selected_index as i32 + delta).clamp(0, max_idx) as usize;
+            for (line_idx, line) in self.lines.iter_mut().skip(3).enumerate() {
+                let rest = line.trim_start_matches("▶ ").trim_start();
+                if line_idx == self.selected_index {
+                    *line = format!("▶ {rest}");
+                } else {
+                    *line = format!("  {rest}");
+                }
+            }
+            return;
+        }
         let max = self.lines.len().saturating_sub(1) as i32;
         self.scroll = (i32::from(self.scroll) + delta).clamp(0, max) as u16;
     }
@@ -281,7 +376,18 @@ pub fn draw_overlay(frame: &mut Frame, area: Rect, overlay: &Overlay, theme: &Th
     let lines: Vec<Line> = overlay
         .lines
         .iter()
-        .map(|line| Line::from(Span::raw(line.clone())))
+        .map(|line| {
+            if line.starts_with("▶ ") {
+                Line::from(Span::styled(
+                    line.clone(),
+                    Style::default()
+                        .fg(theme.focus(theme.chat))
+                        .add_modifier(Modifier::BOLD),
+                ))
+            } else {
+                Line::from(Span::raw(line.clone()))
+            }
+        })
         .collect();
     frame.render_widget(
         Paragraph::new(lines)
@@ -440,8 +546,18 @@ pub fn draw_moves(
     if game.estimate_active {
         lines.push(Line::from(Span::styled(
             format!(
-                "LOCAL ESTIMATE · dead {} · `[a10]` toggles, `estimate confirm|exit`",
+                "LOCAL ESTIMATE · dead {} · `[a10]` toggles, `estimate auto|confirm|exit`",
                 game.estimate_dead.len()
+            ),
+            Style::default().fg(theme.warning),
+        )));
+    }
+    if game.is_reviewing() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "REVIEW · move {}/{} · `prev`/`next`/`last`",
+                game.displayed_move_number(),
+                game.move_number()
             ),
             Style::default().fg(theme.warning),
         )));
@@ -453,6 +569,7 @@ pub fn draw_moves(
             .fg(theme.focus(theme.moves))
             .add_modifier(Modifier::BOLD),
     )));
+    let current_move = game.displayed_move_number();
     for mv in game.game.history() {
         let number = format!("{:>3}", mv.number);
         let color = match mv.color {
@@ -468,7 +585,7 @@ pub fn draw_moves(
         } else {
             format!("  ×{}", mv.captured.len())
         };
-        let style = if mv.number == game.move_number() {
+        let style = if mv.number == current_move {
             Style::default()
                 .fg(theme.last_move)
                 .add_modifier(Modifier::BOLD)
@@ -753,6 +870,8 @@ pub fn board_title(game: &GameView) -> String {
         "estimate"
     } else if game.phase == crate::session::store::GamePhase::StoneRemoval {
         "scoring"
+    } else if game.is_reviewing() {
+        "review"
     } else {
         "board"
     };

@@ -243,7 +243,19 @@ impl App {
 
         if self.overlay.is_some() {
             match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.overlay = None,
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Enter => {
+                    let chosen = self
+                        .overlay
+                        .as_ref()
+                        .and_then(|ov| ov.selected_channel().map(str::to_string));
+                    self.overlay = None;
+                    if let Some(channel) = chosen {
+                        self.session.send(Command::JoinChannel(channel));
+                        self.focus = FocusPane::Chat;
+                        self.chat_scroll_back = 0;
+                    }
+                }
                 KeyCode::Up => {
                     if let Some(overlay) = &mut self.overlay {
                         overlay.scroll_by(-1);
@@ -548,7 +560,28 @@ impl App {
                     channel: self.snapshot.world_channel.clone(),
                 })),
             },
+            UserCommand::BoardSize(size) => {
+                self.session.send(Command::SetBoardSize { game_id, size });
+                self.focus = FocusPane::Board;
+                self.moves_scroll_back = 0;
+            }
             UserCommand::LoadSgf(game_id) => self.session.send(Command::LoadSgf(game_id)),
+            UserCommand::LoadSgfFile(path) => {
+                self.session.send(Command::LoadSgfFile { path });
+                self.focus = FocusPane::Board;
+                self.moves_scroll_back = 0;
+            }
+            UserCommand::SaveSgfFile(path) => match game_id {
+                Some(game_id) => self.session.send(Command::SaveSgfFile { game_id, path }),
+                None => self.set_notice("no game open"),
+            },
+            UserCommand::Step(step) => match game_id {
+                Some(game_id) => {
+                    self.session.send(Command::StepGame { game_id, step });
+                    self.focus = FocusPane::Board;
+                }
+                None => self.set_notice("no game open"),
+            },
             UserCommand::Coordinate(coord) => match game_id {
                 Some(game_id) if estimate_active => {
                     self.session.send(Command::ToggleEstimateDead { game_id, coord })
@@ -591,34 +624,20 @@ impl App {
                 channel: None,
                 text,
             }),
-            UserCommand::Join(channel) => self.session.send(Command::JoinChannel(channel)),
+            UserCommand::Join(channel) => {
+                self.session.send(Command::JoinChannel(channel));
+                self.focus = FocusPane::Chat;
+                self.chat_scroll_back = 0;
+            }
             UserCommand::Part(channel) => self.session.send(Command::PartChannel(channel)),
             UserCommand::Channels => {
                 self.session.send(Command::FetchChannels);
-                let mut lines = vec![format!(
-                    "world: #{}",
-                    self.snapshot.world_channel
-                )];
-                if self.snapshot.available_channels.is_empty() {
-                    lines.push("no channel list yet; press Ctrl+R to refresh".to_string());
-                } else {
-                    for channel in &self.snapshot.available_channels {
-                        let joined = self
-                            .snapshot
-                            .channels
-                            .get(channel)
-                            .map(|state| state.joined)
-                            .unwrap_or(false);
-                        lines.push(format!(
-                            "  #{channel}{}",
-                            if joined { " (joined)" } else { "" }
-                        ));
-                    }
-                }
-                self.overlay = Some(Overlay::new("Channels", lines.join("\n")));
+                self.overlay = Some(Overlay::channel_picker(&self.snapshot));
             }
             UserCommand::World(channel) => {
-                self.session.send(Command::SetWorldChannel(channel))
+                self.session.send(Command::SetWorldChannel(channel));
+                self.focus = FocusPane::Chat;
+                self.chat_scroll_back = 0;
             }
             UserCommand::Estimate(action) => match (game_id, action) {
                 (Some(game_id), EstimateCommand::Enter) => {
@@ -631,12 +650,10 @@ impl App {
                 (Some(game_id), EstimateCommand::Exit) => {
                     self.session.send(Command::EstimateExit { game_id })
                 }
-                (Some(_), EstimateCommand::Auto) => self.overlay = Some(Overlay::new(
-                    "Automatic estimate",
-                    "Automatic dead-stone detection (Monte-Carlo) is not enabled in this build.\n\
-                     The MVP interaction is manual marking: enter `estimate`, click a group with [a10],\n\
-                     then `estimate confirm`. Official scoring still uses dead/dame + score accept.",
-                )),
+                (Some(game_id), EstimateCommand::Auto) => {
+                    self.session.send(Command::EstimateAuto { game_id });
+                    self.focus = FocusPane::Board;
+                }
                 (None, _) => self.set_notice("no game open"),
             },
             UserCommand::OfficialDead { coords, removed } => match game_id {

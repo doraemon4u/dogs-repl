@@ -26,6 +26,7 @@ pub struct ReplOptions {
 struct BoardSignature {
     game_id: u64,
     moves: u16,
+    displayed_move: u16,
     estimate: bool,
     dead: usize,
     phase: GamePhase,
@@ -36,6 +37,7 @@ impl BoardSignature {
         Self {
             game_id: game.id,
             moves: game.move_number(),
+            displayed_move: game.displayed_move_number(),
             estimate: game.estimate_active,
             dead: game.estimate_dead.len(),
             phase: game.phase,
@@ -310,7 +312,8 @@ impl Repl {
             }
             UserCommand::Channels => {
                 self.session.send(Command::FetchChannels);
-                println!("world #{}, joined channels:", store.world_channel);
+                println!("active world channel: #{}", store.world_channel);
+                println!("joined channels:");
                 for (name, channel) in &store.channels {
                     if channel.joined {
                         println!("  #{name} ({} messages)", channel.messages.len());
@@ -319,6 +322,7 @@ impl Repl {
                 if !store.available_channels.is_empty() {
                     println!("available: {}", store.available_channels.join(", "));
                 }
+                println!("tip: use `channels <name>` or `join <name>` to enter a channel");
             }
             UserCommand::Focus(_) => println!(
                 "[i] focus panes are a TUI concept; the REPL prints panes sequentially"
@@ -332,12 +336,10 @@ impl Repl {
                 Some(game_id) => self.session.send(Command::OfficialReject { game_id }),
                 None => println!("[!] no game open"),
             },
-            UserCommand::Estimate(EstimateCommand::Auto) => {
-                println!(
-                    "[i] automatic dead-stone detection is not enabled; use manual marking: \
-                     `estimate`, `[a10]` to toggle a group, `estimate confirm`"
-                );
-            }
+            UserCommand::Estimate(EstimateCommand::Auto) => match game_id {
+                Some(game_id) => self.session.send(Command::EstimateAuto { game_id }),
+                None => println!("[!] no game open"),
+            },
             UserCommand::Login { username, password } => match password {
                 Some(password) => {
                     self.session.send(Command::Login { username, password });
@@ -423,10 +425,24 @@ impl Repl {
                 Some(game_id) => self.session.send(Command::CloseGame(game_id)),
                 None => println!("[!] no game open"),
             },
+            UserCommand::BoardSize(size) => {
+                self.session.send(Command::SetBoardSize { game_id, size });
+            }
             UserCommand::LoadSgf(game_id) => {
                 self.session.send(Command::LoadSgf(game_id));
                 println!("[..] loading SGF for game {game_id}…");
             }
+            UserCommand::LoadSgfFile(path) => {
+                self.session.send(Command::LoadSgfFile { path });
+            }
+            UserCommand::SaveSgfFile(path) => match game_id {
+                Some(game_id) => self.session.send(Command::SaveSgfFile { game_id, path }),
+                None => println!("[!] no game open"),
+            },
+            UserCommand::Step(step) => match game_id {
+                Some(game_id) => self.session.send(Command::StepGame { game_id, step }),
+                None => println!("[!] no game open"),
+            },
             UserCommand::Estimate(action) => match (game_id, action) {
                 (Some(game_id), EstimateCommand::Enter) => {
                     self.session.send(Command::EstimateEnter { game_id })

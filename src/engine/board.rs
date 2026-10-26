@@ -20,7 +20,7 @@ impl Color {
 }
 
 /// A Go board with a fixed size.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Board {
     size: u8,
     grid: Vec<Option<Color>>,
@@ -128,6 +128,11 @@ impl Board {
     /// Returns the total number of stones on the board.
     pub fn stone_count(&self) -> usize {
         self.grid.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Returns the canonical flat grid slice for positional superko comparison.
+    pub fn grid_signature(&self) -> &[Option<Color>] {
+        &self.grid
     }
 }
 

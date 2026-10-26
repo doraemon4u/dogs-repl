@@ -3,3 +3,6 @@
 .omo/
 *.zip
 scripts/.protocol_cache/
+.aistudio/
+node_modules/
+

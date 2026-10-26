@@ -365,17 +365,17 @@ game[12345678]> estimate exit     # 不提交,退出估分模式,棋盘恢复正
 
 ## 11. 待定事项 / Roadmap
 
-- [ ] Realtime 协议字段的完整清单(照 `goban` 的 `protocol.ts` 逐条迁移)
-- [ ] 协议同步脚本的具体实现(拉取频率、diff 报警方式)
-- [ ] 方案 A vs 方案 B 的最终取舍时机
-- [ ] SGF 导入/导出的完整支持范围
-- [ ] 时间制(byo-yomi/fischer/canadian)在 Engine 层的状态机设计
-- [ ] 世界聊天语言频道列表的动态拉取与展示方式
-- [ ] MVP 优先级排序:建议第一阶段先落地 `Coord` 解析器 + `Board` 校验(Engine 层最容易独立测试的部分)
-- [ ] Pane 焦点切换的按键绑定最终选定(Tab / Ctrl+1-3)
-- [ ] REPL 输入行是否加框的最终决定
-- [ ] 终端 truecolor 检测与降级配色的具体实现
-- [ ] estimate 自动死活检测(蒙特卡洛模拟,迁移自 `goban`)是否纳入 MVP 后第一阶段
+- [x] Realtime 协议字段的完整清单(照 `goban` 的 `protocol.ts` 逐条迁移)
+- [x] 协议同步脚本的具体实现(拉取频率、diff 报警方式:`scripts/sync_protocol.py --check|--json`)
+- [x] 方案 A vs 方案 B 的最终取舍时机(采用方案 A 半自动同步脚本)
+- [x] SGF 导入/导出的完整支持范围(支持 `sgf load/save`、完整元信息、`TM`/`OT` 时间制与 `step`/`prev`/`next`/`first`/`last`/`goto` 复盘跳转)
+- [x] 时间制(byo-yomi/fischer/canadian)在 Engine 层的状态机设计
+- [x] 世界聊天语言频道列表的动态拉取与展示方式(支持 `/chat/channels/`、`/ui/config` 字典/数组及内置默认语言频道回退)
+- [x] MVP 优先级排序:建议第一阶段先落地 `Coord` 解析器 + `Board` 校验(Engine 层最容易独立测试的部分)
+- [x] Pane 焦点切换的按键绑定最终选定(Tab / Shift+Tab / Ctrl+1-3 / `focus <pane>`)
+- [x] REPL 输入行是否加框的最终决定(保持底部 2 行无框状态栏 + 输入栏)
+- [x] 终端 truecolor 检测与降级配色的具体实现(`ColorSupport::detect()`)
+- [x] estimate 自动死活检测(蒙特卡洛模拟,迁移自 `goban`)是否纳入 MVP 后第一阶段(`estimate auto` 已实现并接入 TUI/REPL)
 
 ---
 
