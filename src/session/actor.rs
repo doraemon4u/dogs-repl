@@ -1713,7 +1713,7 @@ impl Actor {
                                 .map(|g| !g.connected && g.move_number() == 0)
                                 .unwrap_or(false);
                         let auto_open = if on_untouched_local {
-                            state.my_games.first().map(|g| g.id)
+                            state.my_games.first().and_then(|g| u64::try_from(g.id).ok())
                         } else {
                             None
                         };
