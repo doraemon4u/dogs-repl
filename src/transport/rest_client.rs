@@ -215,7 +215,7 @@ impl RestClient {
                 continue;
             }
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status}: {body}"));
+            return Err(format_http_error(status, &body));
         }
     }
 
@@ -272,12 +272,29 @@ impl RestClient {
             }
 
             let body = response.text().await.unwrap_or_default();
-            return Err(format!("HTTP {status}: {body}"));
+            return Err(format_http_error(status, &body));
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base, path)
+    }
+}
+
+fn format_http_error(status: reqwest::StatusCode, body: &str) -> String {
+    let trimmed = body.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty() || lower.starts_with("<!doctype") || lower.starts_with("<html") {
+        format!("HTTP {status}")
+    } else {
+        let single_line: String = trimmed
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let capped: String = single_line.chars().take(120).collect();
+        format!("HTTP {status}: {capped}")
     }
 }
 

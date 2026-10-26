@@ -176,6 +176,21 @@ pub fn draw_board(
         return;
     }
 
+    let show_bottom_coords = area.height > needed_height;
+    let show_right_coords = area.width >= needed_width + LABEL_WIDTH;
+    let total_w = if show_right_coords {
+        needed_width + LABEL_WIDTH
+    } else {
+        needed_width
+    };
+    let total_h = if show_bottom_coords {
+        needed_height + 1
+    } else {
+        needed_height
+    };
+    let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
+    let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
+
     let muted = theme.dim(theme.board);
     let header_style = Style::default().fg(if focused {
         theme.focus(theme.board)
@@ -184,8 +199,12 @@ pub fn draw_board(
     });
     for col in 0..size {
         if let Some(letter) = Board::letter_for_col(col) {
-            let x = area.x + LABEL_WIDTH + u16::from(col) * 2;
-            buffer.set_string(x, area.y, &letter.to_string(), header_style);
+            let x = origin_x + LABEL_WIDTH + u16::from(col) * 2;
+            let s = letter.to_string();
+            buffer.set_string(x, origin_y, &s, header_style);
+            if show_bottom_coords {
+                buffer.set_string(x, origin_y + 1 + u16::from(size), &s, header_style);
+            }
         }
     }
 
@@ -194,13 +213,24 @@ pub fn draw_board(
         .then(|| game.estimate_overlay())
         .unwrap_or_default();
     let last_move = game.last_move();
+    let grid_line_style = Style::default().fg(muted);
+
     for row_index in 0..size {
         let row = u16::from(size) - u16::from(row_index);
-        let y = area.y + 1 + u16::from(row_index);
-        let label = format!("{row:>width$}", width = LABEL_WIDTH as usize);
-        buffer.set_string(area.x, y, &label, Style::default().fg(muted));
+        let y = origin_y + 1 + u16::from(row_index);
+        let label = format!("{row:>width$} ", width = LABEL_WIDTH as usize - 1);
+        buffer.set_string(origin_x, y, &label, Style::default().fg(muted));
+        if show_right_coords {
+            let right_label = format!(" {row:<width$}", width = LABEL_WIDTH as usize - 1);
+            buffer.set_string(
+                origin_x + LABEL_WIDTH + u16::from(size) * 2,
+                y,
+                &right_label,
+                Style::default().fg(muted),
+            );
+        }
         for col in 0..size {
-            let x = area.x + LABEL_WIDTH + u16::from(col) * 2;
+            let x = origin_x + LABEL_WIDTH + u16::from(col) * 2;
             let estimate = if game.estimate_active {
                 overlay
                     .get(row_index as usize)
@@ -217,6 +247,9 @@ pub fn draw_board(
                 style = style.fg(theme.last_move).add_modifier(Modifier::REVERSED);
             }
             buffer.set_string(x, y, &cell, style);
+            if cell.chars().count() == 1 && col + 1 < size {
+                buffer.set_string(x + 1, y, "─", grid_line_style);
+            }
         }
     }
 }

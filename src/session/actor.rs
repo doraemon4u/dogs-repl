@@ -400,7 +400,13 @@ impl Actor {
                         let id = game_id
                             .or(state.active_game)
                             .unwrap_or(42);
-                        let view = GameView::empty(id, size);
+                        let mut view = GameView::empty(id, size);
+                        if let Some(username) = &state.username {
+                            view.black = username.clone();
+                        }
+                        view.white = "local-board".to_string();
+                        view.our_color = Some(Color::Black);
+                        view.connected = false;
                         state.games.insert(id, view);
                         state.switch_to_game(id);
                         id
@@ -422,12 +428,37 @@ impl Actor {
                 self.play_move(game_id, coord).await;
             }
             Command::Pass { game_id } => {
-                if let Some(realtime) = &self.realtime {
-                    realtime.pass(game_id as i64);
-                    self.log(LogLevel::Info, format!("game {game_id}: pass sent"))
-                        .await;
+                let is_remote = self
+                    .state
+                    .read()
+                    .await
+                    .game(game_id)
+                    .map(|g| g.connected)
+                    .unwrap_or(false)
+                    && self.realtime.is_some();
+                if is_remote {
+                    if let Some(realtime) = &self.realtime {
+                        realtime.pass(game_id as i64);
+                        self.log(LogLevel::Info, format!("game {game_id}: pass sent"))
+                            .await;
+                    }
                 } else {
-                    self.offline_warning("pass").await;
+                    let passed = {
+                        let mut state = self.state.write().await;
+                        state.game_mut(game_id).map(|g| {
+                            let color = g.play_local_pass();
+                            (color, g.move_number())
+                        })
+                    };
+                    if let Some((color, move_no)) = passed {
+                        self.log(
+                            LogLevel::Success,
+                            format!("game {game_id}: move #{move_no} {color:?} passed (ko cleared)"),
+                        )
+                        .await;
+                    } else {
+                        self.offline_warning("pass").await;
+                    }
                 }
             }
             Command::Resign { game_id } => {
@@ -630,6 +661,15 @@ impl Actor {
                     state.user_id = user_id;
                     state.connection = crate::session::store::ConnectionState::Connecting;
                     state.connection_message = None;
+                    if state.games.is_empty() && state.active_game.is_none() {
+                        let mut view = GameView::empty(42, 9);
+                        view.black = bootstrap.username.clone();
+                        view.white = "local-board".to_string();
+                        view.our_color = Some(Color::Black);
+                        view.connected = false;
+                        state.games.insert(42, view);
+                        state.active_game = Some(42);
+                    }
                 }
                 self.auth = Some(bootstrap.auth.clone());
                 self.rest = Some(Arc::new(RestClient::new(bootstrap.auth.clone())));
@@ -777,11 +817,12 @@ impl Actor {
                     game.phase,
                     Some(game.to_play()),
                     Some(game.validate_move(coord)),
+                    game.connected,
                 ),
-                None => (19, crate::session::store::GamePhase::Play, None, None),
+                None => (19, crate::session::store::GamePhase::Play, None, None, true),
             }
         };
-        let (size, phase, to_play, rule_check) = validation;
+        let (size, phase, to_play, rule_check, is_connected_game) = validation;
         if !coord.is_on_board(size) {
             self.log(
                 LogLevel::Error,
@@ -806,26 +847,28 @@ impl Actor {
             .await;
             return;
         }
-        if let Some(realtime) = &self.realtime {
-            {
-                let mut state = self.state.write().await;
-                if let Some(game) = state.game_mut(game_id) {
-                    if let Some(cursor) = game.view_move {
-                        let _ = game.game.truncate_to(cursor);
-                        game.set_view_move(None);
+        if is_connected_game && self.realtime.is_some() {
+            if let Some(realtime) = &self.realtime {
+                {
+                    let mut state = self.state.write().await;
+                    if let Some(game) = state.game_mut(game_id) {
+                        if let Some(cursor) = game.view_move {
+                            let _ = game.game.truncate_to(cursor);
+                            game.set_view_move(None);
+                        }
                     }
                 }
+                realtime.play_move(game_id as i64, &coord.to_gtp());
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "game {game_id}: play {} ({} to move) sent",
+                        coord.to_gtp(),
+                        to_play.map(|color| format!("{color:?}")).unwrap_or_default()
+                    ),
+                )
+                .await;
             }
-            realtime.play_move(game_id as i64, &coord.to_gtp());
-            self.log(
-                LogLevel::Info,
-                format!(
-                    "game {game_id}: play {} ({} to move) sent",
-                    coord.to_gtp(),
-                    to_play.map(|color| format!("{color:?}")).unwrap_or_default()
-                ),
-            )
-            .await;
         } else {
             let local_outcome = {
                 let mut state = self.state.write().await;
@@ -1660,10 +1703,27 @@ impl Actor {
             },
             Internal::MyGames(result) => match result {
                 Ok(value) => {
-                    self.state.write().await.apply_my_games(&value);
-                    let count = self.state.read().await.my_games.len();
+                    let (count, auto_open_id) = {
+                        let mut state = self.state.write().await;
+                        state.apply_my_games(&value);
+                        let count = state.my_games.len();
+                        let on_untouched_local = state.active_game == Some(42)
+                            && state
+                                .game(42)
+                                .map(|g| !g.connected && g.move_number() == 0)
+                                .unwrap_or(false);
+                        let auto_open = if on_untouched_local {
+                            state.my_games.first().map(|g| g.id)
+                        } else {
+                            None
+                        };
+                        (count, auto_open)
+                    };
                     self.log(LogLevel::Info, format!("{count} active game(s)"))
                         .await;
+                    if let Some(real_id) = auto_open_id {
+                        self.open_game(real_id).await;
+                    }
                 }
                 Err(error) => {
                     self.log(LogLevel::Warning, format!("GET /me/games failed: {error}"))
@@ -1698,12 +1758,7 @@ impl Actor {
                         self.spawn_channel_fallback();
                     }
                 }
-                Err(error) => {
-                    self.log(
-                        LogLevel::Warning,
-                        format!("chat channel list failed ({error}); falling back to /ui/config"),
-                    )
-                    .await;
+                Err(_error) => {
                     self.spawn_channel_fallback();
                 }
             },

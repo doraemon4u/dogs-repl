@@ -987,21 +987,28 @@ fn payload_text(payload: &Payload) -> String {
     }
 }
 
-/// Set `OGS_TUI_TRACE=0` to silence, `=all` to also dump the `active-bots`
-/// catalog.
+/// Set `OGS_TUI_TRACE=1` (or `=all` to also dump the `active-bots` catalog)
+/// or pass `--trace` on the command line to print socket frames to stderr.
 ///
-/// On by default: OGS pushes that catalog right after connect — over a
-/// thousand frames — which buries the few frames that explain login. Outbound
-/// traffic is low-volume and always shown; inbound is filtered to events that
-/// matter for authentication.
+/// Off by default so stderr output never corrupts the full-screen TUI buffer.
 fn tracing_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OGS_TUI_TRACE").as_deref() != Ok("0"))
+    *ON.get_or_init(|| {
+        matches!(
+            std::env::var("OGS_TUI_TRACE").as_deref(),
+            Ok("1" | "true" | "TRUE" | "yes" | "YES" | "all" | "ALL")
+        )
+    })
 }
 
 fn trace_everything() -> bool {
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ALL.get_or_init(|| std::env::var("OGS_TUI_TRACE").as_deref() == Ok("all"))
+    *ALL.get_or_init(|| {
+        matches!(
+            std::env::var("OGS_TUI_TRACE").as_deref(),
+            Ok("all" | "ALL")
+        )
+    })
 }
 
 fn is_auth_relevant(event: &Event) -> bool {

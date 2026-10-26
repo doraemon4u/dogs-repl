@@ -346,6 +346,22 @@ impl GameView {
         Ok(color)
     }
 
+    /// Branches from the current review cursor (if reviewing) and records a pass on the local board.
+    pub fn play_local_pass(&mut self) -> Color {
+        if let Some(cursor) = self.view_move {
+            let _ = self.game.truncate_to(cursor);
+            self.view_move = None;
+            self.review_game = None;
+        }
+        let color = self.game.to_play();
+        self.game.pass();
+        self.clock.on_move(color);
+        if self.estimate_active {
+            self.recompute_estimate();
+        }
+        color
+    }
+
     /// Moves the non-destructive review cursor to `target` (`None` returns to live).
     pub fn set_view_move(&mut self, target: Option<u16>) -> u16 {
         let total = self.game.move_number();
@@ -528,7 +544,7 @@ impl GameView {
         };
         view.clock = Clock::new(sgf.time_control(), active);
         view.game = game;
-        view.connected = true;
+        view.connected = false;
         Ok(view)
     }
 
@@ -1412,7 +1428,66 @@ pub fn notification_text(value: &Value) -> String {
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("notification");
-    format!("{kind}: {value}")
+    let game_id = value.get("game_id").and_then(Value::as_u64);
+    let game_name = value
+        .get("name")
+        .or_else(|| value.get("game_name"))
+        .and_then(Value::as_str);
+
+    match kind {
+        "gameEnded" | "game_ended" => {
+            let black = value.get("black").and_then(Value::as_str).unwrap_or("Black");
+            let white = value.get("white").and_then(Value::as_str).unwrap_or("White");
+            let id_tag = game_id.map(|id| format!(" #{id}")).unwrap_or_default();
+            let title = game_name.unwrap_or("game");
+            format!("gameEnded{id_tag} ({title}): {black} vs {white}")
+        }
+        "yourMove" | "your_move" | "gameStarted" | "timeStarted" => {
+            let id_tag = game_id.map(|id| format!(" #{id}")).unwrap_or_default();
+            let opponent = value
+                .get("opponent")
+                .or_else(|| value.get("player"))
+                .and_then(|v| v.as_str().or_else(|| v.get("username").and_then(Value::as_str)))
+                .unwrap_or("");
+            if opponent.is_empty() {
+                format!("{kind}: game{id_tag}")
+            } else {
+                format!("{kind}: game{id_tag} vs {opponent}")
+            }
+        }
+        "lateChatReceivedInGame" => {
+            let from = value
+                .get("from")
+                .and_then(|f| f.get("username").or_else(|| f.get("name")).and_then(Value::as_str))
+                .unwrap_or("player");
+            let id_tag = game_id.map(|id| format!(" #{id}")).unwrap_or_default();
+            format!("chat from {from} in game{id_tag}")
+        }
+        "streak_at_risk" => {
+            let streak = value.get("streak").and_then(Value::as_u64).unwrap_or(1);
+            let day = value.get("local_day").and_then(Value::as_str).unwrap_or("");
+            if day.is_empty() {
+                format!("streak at risk ({streak} day(s))")
+            } else {
+                format!("streak at risk: {streak} day(s) ({day})")
+            }
+        }
+        "challenge" => {
+            let from = value
+                .get("user")
+                .or_else(|| value.get("challenger"))
+                .and_then(|u| u.as_str().or_else(|| u.get("username").and_then(Value::as_str)))
+                .unwrap_or("player");
+            format!("challenge from {from}")
+        }
+        _ => {
+            if let Some(id) = game_id {
+                format!("{kind} (game #{id})")
+            } else {
+                kind.to_string()
+            }
+        }
+    }
 }
 
 #[cfg(test)]

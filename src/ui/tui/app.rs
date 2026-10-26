@@ -115,6 +115,12 @@ struct App {
 
 impl App {
     fn new(session: SessionHandle, theme: Theme, startup: Startup) -> Self {
+        if startup.initial_game.is_none() {
+            session.send(Command::SetBoardSize {
+                game_id: Some(42),
+                size: 9,
+            });
+        }
         Self {
             session,
             theme,
