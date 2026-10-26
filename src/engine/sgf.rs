@@ -75,6 +75,14 @@ pub struct SgfGame {
 }
 
 impl SgfGame {
+    /// Creates an empty SGF game for `board_size`.
+    pub fn new(board_size: u8) -> Self {
+        Self {
+            board_size,
+            ..Self::default()
+        }
+    }
+
     /// Parses the first game from an SGF string.
     pub fn parse(input: &str) -> Result<Self, SgfError> {
         Self::parse_collection(input)?
@@ -578,6 +586,12 @@ impl std::fmt::Display for SgfError {
 }
 
 impl std::error::Error for SgfError {}
+
+impl From<SgfError> for String {
+    fn from(err: SgfError) -> Self {
+        err.to_string()
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -74,6 +74,10 @@ impl ChatScope {
         }
     }
 
+    pub fn game(game_id: u64) -> Self {
+        Self::Game { game_id }
+    }
+
     /// The storage key of the channel this scope shows.
     pub fn channel_key(&self) -> String {
         match self {
@@ -468,28 +472,28 @@ impl GameView {
 
     /// Converts this game view into an [`SgfGame`] with full metadata and time control.
     pub fn to_sgf_game(&self) -> SgfGame {
-        let mut sgf = SgfGame::new(self.size);
-        sgf.komi = self.komi;
+        let mut sgf = crate::engine::sgf::from_game(
+            &self.game,
+            self.komi,
+            Some(self.black.clone()),
+            Some(self.white.clone()),
+        );
+        sgf.board_size = self.size;
         sgf.rules = Some(self.rules.clone());
-        sgf.player_black = Some(self.black.clone());
-        sgf.player_white = Some(self.white.clone());
         sgf.game_name = Some(format!("OGS Game #{}", self.id));
         sgf.result = self.result.clone();
         sgf.set_time_control(self.clock.control());
-        for &(color, coord) in self.game.setup_stones() {
-            match color {
-                Color::Black => sgf.setup_black.push(coord),
-                Color::White => sgf.setup_white.push(coord),
-            }
-        }
         sgf.moves = self
             .game
             .history()
             .iter()
-            .map(|mv| SgfMove {
-                color: mv.color,
-                coord: mv.coord,
-                comment: None,
+            .map(|mv| match mv.coord {
+                Some(coord) => SgfMove::from_coord(mv.color, coord, self.size),
+                None => SgfMove {
+                    color: mv.color,
+                    col: None,
+                    row: None,
+                },
             })
             .collect();
         sgf
@@ -497,7 +501,7 @@ impl GameView {
 
     /// Builds a [`GameView`] from a parsed [`SgfGame`].
     pub fn from_sgf_game(id: u64, sgf: &SgfGame) -> Result<Self, String> {
-        let game = sgf.replay_game()?;
+        let game = sgf.replay_game().map_err(|e| e.to_string())?;
         let size = game.size();
         let mut view = Self::empty(id, size);
         view.size = size;
@@ -1366,7 +1370,7 @@ pub fn apply_clock_update(game: &mut GameView, value: &Value) {
             if let Some(seconds) = clock_seconds(entry) {
                 let (periods, period_time, stones_left) = clock_overtime(entry);
                 game.clock
-                    .sync_player(color, seconds, periods, period_time, stones_left);
+                    .sync_player(color, Some(seconds), periods, period_time, stones_left);
             }
         }
     }

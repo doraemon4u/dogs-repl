@@ -9,12 +9,8 @@ use crate::engine::board::Color as StoneColor;
 use crate::engine::estimate::{score, ScoringRules};
 use crate::session::store::{ChatScope, ConnectionState, GameView, LogLevel, Store};
 use crate::session::{Command, SessionHandle};
-use crate::transport::rest_client::ChallengeClock;
 use crate::ui::challenge_options;
-use crate::ui::commands::{
-    self, ChallengeClockSpec, ChallengeSpec, EstimateCommand, ScoreCommand, UndoCommand,
-    UserCommand,
-};
+use crate::ui::commands::{self, EstimateCommand, ScoreCommand, UndoCommand, UserCommand};
 use crate::ui::tui::input::InputState;
 use crate::ui::tui::layout::{self, Scene};
 use crate::ui::tui::theme::{ColorSupport, Theme};
