@@ -1405,9 +1405,9 @@ mod tests {
             })]),
         );
         match events.try_recv().unwrap() {
-            RealtimeEvent::ChatJoin { channel, data } => {
+            RealtimeEvent::ChatJoin { channel, users } => {
                 assert_eq!(channel, "en");
-                assert_eq!(data["users"][0]["username"], json!("nomad"));
+                assert_eq!(users, vec![(1, "nomad".to_string())]);
             }
             other => panic!("unexpected: {other:?}"),
         }

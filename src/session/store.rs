@@ -106,6 +106,78 @@ pub fn game_channel(game_id: u64) -> String {
     format!("game/{game_id}")
 }
 
+/// Maps a user-facing short channel name (e.g. `"en"`, `"zh"`, `"#ja"`) to OGS's
+/// real Socket.IO wire room ID (e.g. `"global-english"`, `"global-zh-hans"`, `"global-japanese"`),
+/// matching `online-go/online-go.com` `src/lib/chat_manager.ts`.
+pub fn to_ogs_wire_channel(channel: &str) -> String {
+    let raw = channel.trim().trim_start_matches('#');
+    if raw.starts_with("game/") || raw.starts_with("tournament-") || raw.starts_with("group-") {
+        return raw.to_string();
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("global-") || lower.starts_with("country-") || lower.starts_with("custom-")
+    {
+        return lower;
+    }
+    match lower.as_str() {
+        "en" | "eng" | "english" => "global-english".to_string(),
+        "zh" | "cn" | "zh-cn" | "zh-hans" | "chinese" => "global-zh-hans".to_string(),
+        "zh-tw" | "zh-hk" | "zh-hant" | "tw" => "global-zh-hant".to_string(),
+        "ja" | "jp" | "japanese" => "global-japanese".to_string(),
+        "ko" | "kr" | "korean" => "global-korean".to_string(),
+        "de" | "ger" | "german" => "global-german".to_string(),
+        "fr" | "fre" | "french" => "global-french".to_string(),
+        "es" | "spa" | "spanish" => "global-spanish".to_string(),
+        "ru" | "rus" | "russian" => "global-russian".to_string(),
+        "pt" | "por" | "portuguese" | "pt-br" => "global-portuguese".to_string(),
+        "it" | "ita" | "italian" => "global-italian".to_string(),
+        "help" => "global-help".to_string(),
+        "offtopic" | "off-topic" => "global-offtopic".to_string(),
+        "rengo" => "global-rengo".to_string(),
+        "joseki" => "global-joseki".to_string(),
+        "tournaments" => "global-tournaments".to_string(),
+        "beginners" | "beginner" => "global-beginners".to_string(),
+        "pro" => "global-pro".to_string(),
+        "computer" | "ai" | "bots" => "global-computer-go-chat".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Maps an OGS wire room ID or user channel string into a canonical internal storage key
+/// (e.g. `"global-english"` -> `"en"`, `"global-zh-hans"` -> `"zh"`, `"#EN"` -> `"en"`).
+pub fn canonical_channel_key(channel: &str) -> String {
+    let raw = channel.trim().trim_start_matches('#');
+    if raw.is_empty() {
+        return String::new();
+    }
+    if raw.starts_with("game/") {
+        return raw.to_string();
+    }
+    let lower = raw.to_ascii_lowercase();
+    match lower.as_str() {
+        "global-english" | "en" | "eng" | "english" => "en".to_string(),
+        "global-zh-hans" | "zh" | "cn" | "zh-cn" | "zh-hans" | "chinese" => "zh".to_string(),
+        "global-zh-hant" | "zh-tw" | "zh-hk" | "zh-hant" | "tw" => "zh-hant".to_string(),
+        "global-japanese" | "ja" | "jp" | "japanese" => "ja".to_string(),
+        "global-korean" | "ko" | "kr" | "korean" => "ko".to_string(),
+        "global-german" | "de" | "ger" | "german" => "de".to_string(),
+        "global-french" | "fr" | "fre" | "french" => "fr".to_string(),
+        "global-spanish" | "es" | "spa" | "spanish" => "es".to_string(),
+        "global-russian" | "ru" | "rus" | "russian" => "ru".to_string(),
+        "global-portuguese" | "pt" | "por" | "portuguese" | "pt-br" => "pt".to_string(),
+        "global-italian" | "it" | "ita" | "italian" => "it".to_string(),
+        "global-help" | "help" => "help".to_string(),
+        "global-offtopic" | "offtopic" | "off-topic" => "offtopic".to_string(),
+        "global-rengo" | "rengo" => "rengo".to_string(),
+        "global-joseki" | "joseki" => "joseki".to_string(),
+        "global-tournaments" | "tournaments" => "tournaments".to_string(),
+        "global-beginners" | "beginners" | "beginner" => "beginners".to_string(),
+        "global-pro" | "pro" => "pro".to_string(),
+        "global-computer-go-chat" | "computer" | "ai" | "bots" => "computer".to_string(),
+        other => other.strip_prefix("global-").unwrap_or(other).to_string(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatKind {
     Chat,
@@ -121,6 +193,7 @@ pub struct ChatLine {
     pub text: String,
     pub kind: ChatKind,
     pub at: SystemTime,
+    pub msg_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +202,8 @@ pub struct ChannelState {
     pub unread: u32,
     pub joined: bool,
     pub topic: Option<String>,
+    pub seen_ids: HashSet<String>,
+    pub users: BTreeMap<i64, String>,
 }
 
 impl ChannelState {
@@ -653,51 +728,207 @@ impl Store {
     }
 
     pub fn ensure_channel(&mut self, channel: &str) -> &mut ChannelState {
-        self.channels.entry(channel.to_string()).or_default()
+        let key = canonical_channel_key(channel);
+        let key = if key.is_empty() {
+            channel.to_string()
+        } else {
+            key
+        };
+        self.channels.entry(key).or_default()
     }
 
     /// The channel key the chat pane is currently showing.
     pub fn current_chat_channel(&self) -> String {
-        self.chat_scope.channel_key()
+        canonical_channel_key(&self.chat_scope.channel_key())
     }
 
     /// Adds an incoming chat line and updates unread counters.
     pub fn push_chat(&mut self, channel: &str, author: &str, text: &str) {
+        self.push_chat_meta(channel, author, text, None, None, true);
+    }
+
+    /// Adds an incoming chat line with optional message UUID and timestamp,
+    /// deduplicating replayed messages and upgrading local optimistic `"you: ..."` echoes in-place.
+    pub fn push_chat_meta(
+        &mut self,
+        channel: &str,
+        author: &str,
+        text: &str,
+        msg_id: Option<String>,
+        timestamp_secs: Option<u64>,
+        bump_unread: bool,
+    ) -> bool {
+        let canonical = canonical_channel_key(channel);
+        let key = if canonical.is_empty() {
+            channel.to_string()
+        } else {
+            canonical
+        };
         let current = self.current_chat_channel();
+        let our_username = self.username.clone();
+
+        {
+            let state = self.ensure_channel(&key);
+            if let Some(ref id) = msg_id {
+                if !id.is_empty() && !state.seen_ids.insert(id.clone()) {
+                    return false;
+                }
+            }
+            // If this incoming message is our own message echoed back from the server,
+            // upgrade the local optimistic `you: <text>` system line in-place.
+            let is_self = our_username
+                .as_deref()
+                .is_some_and(|me| me.eq_ignore_ascii_case(author))
+                || author.eq_ignore_ascii_case("you");
+            if is_self {
+                let expected = format!("you: {text}");
+                if let Some(existing) = state
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|m| m.kind == ChatKind::System && m.text == expected)
+                {
+                    existing.kind = ChatKind::Chat;
+                    existing.author = author.to_string();
+                    existing.text = text.to_string();
+                    existing.msg_id = msg_id;
+                    return true;
+                }
+            }
+        }
+
         self.chat_seq += 1;
+        let at = timestamp_secs
+            .and_then(|secs| SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(secs)))
+            .unwrap_or_else(SystemTime::now);
         let line = ChatLine {
             seq: self.chat_seq,
-            channel: channel.to_string(),
+            channel: key.clone(),
             author: author.to_string(),
             text: text.to_string(),
             kind: ChatKind::Chat,
-            at: SystemTime::now(),
+            at,
+            msg_id,
         };
-        let update_unread = current != channel;
-        let state = self.ensure_channel(channel);
+        let update_unread = bump_unread && current != key;
+        let state = self.ensure_channel(&key);
         state.push(line);
         if update_unread {
             state.unread = state.unread.saturating_add(1);
         }
+        true
     }
 
     /// Adds a local system line to a channel.
     pub fn push_system_chat(&mut self, channel: &str, text: impl Into<String>) {
+        let canonical = canonical_channel_key(channel);
+        let key = if canonical.is_empty() {
+            channel.to_string()
+        } else {
+            canonical
+        };
         self.chat_seq += 1;
         let line = ChatLine {
             seq: self.chat_seq,
-            channel: channel.to_string(),
+            channel: key.clone(),
             author: String::new(),
             text: text.into(),
             kind: ChatKind::System,
             at: SystemTime::now(),
+            msg_id: None,
         };
-        self.ensure_channel(channel).push(line);
+        self.ensure_channel(&key).push(line);
+    }
+
+    /// Records users present or joining a chat channel (`chat-join` / `chat-update-user`).
+    pub fn apply_channel_join(&mut self, channel: &str, users: &[(i64, String)]) -> usize {
+        let state = self.ensure_channel(channel);
+        state.joined = true;
+        let mut count = 0;
+        for (id, name) in users {
+            if !name.is_empty() {
+                let key = if *id != 0 {
+                    *id
+                } else {
+                    -(state.users.len() as i64 + 1)
+                };
+                state.users.insert(key, name.clone());
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Removes a user who left a chat channel (`chat-part`).
+    pub fn apply_channel_part(&mut self, channel: &str, user_id: i64, username: &str) {
+        let state = self.ensure_channel(channel);
+        if user_id != 0 {
+            state.users.remove(&user_id);
+        } else if !username.is_empty() {
+            state.users.retain(|_, v| !v.eq_ignore_ascii_case(username));
+        }
+    }
+
+    /// Updates a channel's topic (`chat-topic`).
+    pub fn apply_channel_topic(&mut self, channel: &str, topic: &str) {
+        let trimmed = topic.trim();
+        let state = self.ensure_channel(channel);
+        if trimmed.is_empty() {
+            state.topic = None;
+        } else {
+            state.topic = Some(trimmed.to_string());
+        }
+    }
+
+    /// Removes a chat message by UUID (`chat-message-removed`).
+    pub fn remove_chat_message(&mut self, channel: &str, uuid: &str) -> bool {
+        if uuid.is_empty() {
+            return false;
+        }
+        let state = self.ensure_channel(channel);
+        let before = state.messages.len();
+        state
+            .messages
+            .retain(|m| m.msg_id.as_deref() != Some(uuid));
+        state.messages.len() < before
+    }
+
+    /// Syncs earlier game chat history from `gamedata.chat` or REST `/api/v1/games/:id`.
+    pub fn apply_gamedata_chat(&mut self, game_id: u64, value: &Value) -> usize {
+        let rows = value
+            .get("chat")
+            .and_then(Value::as_array)
+            .or_else(|| {
+                value
+                    .get("gamedata")
+                    .and_then(|g| g.get("chat"))
+                    .and_then(Value::as_array)
+            });
+        let Some(rows) = rows else {
+            return 0;
+        };
+        let ch = game_channel(game_id);
+        let mut added = 0;
+        for entry in rows {
+            let author = extract_chat_author(entry);
+            let Some(text) = extract_chat_text(entry) else {
+                continue;
+            };
+            let msg_id = extract_chat_id(entry).or_else(|| {
+                let ts = extract_chat_timestamp(entry).unwrap_or(0);
+                Some(format!("gchat:{game_id}:{ts}:{author}:{text}"))
+            });
+            let ts = extract_chat_timestamp(entry);
+            if self.push_chat_meta(&ch, &author, &text, msg_id, ts, false) {
+                added += 1;
+            }
+        }
+        added
     }
 
     /// Switches the chat pane without unsubscribing the world channel.
     pub fn set_chat_scope(&mut self, scope: ChatScope) {
-        let key = scope.channel_key();
+        let key = canonical_channel_key(&scope.channel_key());
         self.chat_scope = scope;
         if let Some(channel) = self.channels.get_mut(&key) {
             channel.unread = 0;
@@ -727,10 +958,16 @@ impl Store {
 
     /// Sets the active world channel, keeping the previous channel's history.
     pub fn set_world_channel(&mut self, channel: &str) {
-        self.world_channel = channel.to_string();
-        self.ensure_channel(channel);
+        let canonical = canonical_channel_key(channel);
+        let key = if canonical.is_empty() {
+            channel.to_string()
+        } else {
+            canonical
+        };
+        self.world_channel = key.clone();
+        self.ensure_channel(&key);
         if matches!(self.chat_scope, ChatScope::World { .. }) {
-            self.set_chat_scope(ChatScope::world(channel));
+            self.set_chat_scope(ChatScope::world(key));
         }
     }
 
@@ -2084,13 +2321,13 @@ mod tests {
     #[test]
     fn push_chat_meta_deduplicates_uuid_and_upgrades_optimistic_echo() {
         let mut store = Store::new("zh");
-        store.session.username = Some("alice".to_string());
-        store.chat_scope = ChatScope::World;
+        store.username = Some("alice".to_string());
+        store.chat_scope = ChatScope::world("zh");
 
         // Optimistic echo when user sends a message locally
-        store.push_chat_system("zh", "you: 你好 OGS");
+        store.push_system_chat("zh", "you: 你好 OGS");
         assert_eq!(store.channels["zh"].messages.len(), 1);
-        assert!(store.channels["zh"].messages[0].system);
+        assert_eq!(store.channels["zh"].messages[0].kind, ChatKind::System);
 
         // Server echoes back the real chat-message with uuid
         let inserted = store.push_chat_meta(
@@ -2099,10 +2336,11 @@ mod tests {
             "你好 OGS",
             Some("msg-uuid-1".to_string()),
             None,
+            true,
         );
         assert!(inserted);
         assert_eq!(store.channels["zh"].messages.len(), 1);
-        assert!(!store.channels["zh"].messages[0].system);
+        assert_eq!(store.channels["zh"].messages[0].kind, ChatKind::Chat);
         assert_eq!(store.channels["zh"].messages[0].author, "alice");
 
         // Duplicate replay of same msg-uuid-1 is ignored
@@ -2112,6 +2350,7 @@ mod tests {
             "你好 OGS",
             Some("msg-uuid-1".to_string()),
             None,
+            true,
         );
         assert!(!duplicate);
         assert_eq!(store.channels["zh"].messages.len(), 1);
@@ -2122,25 +2361,13 @@ mod tests {
         let mut store = Store::new("en");
         let added = store.apply_channel_join(
             "global-english",
-            &json!({
-                "channel": "global-english",
-                "users": [
-                    { "id": 1, "username": "nomad" },
-                    { "id": 2, "username": "kisei" }
-                ]
-            }),
+            &[(1, "nomad".to_string()), (2, "kisei".to_string())],
         );
         assert_eq!(added, 2);
         assert!(store.channels["en"].joined);
         assert_eq!(store.channels["en"].users.len(), 2);
 
-        store.apply_channel_part(
-            "global-english",
-            &json!({
-                "channel": "global-english",
-                "user": { "id": 1, "username": "nomad" }
-            }),
-        );
+        store.apply_channel_part("global-english", 1, "nomad");
         assert_eq!(store.channels["en"].users.len(), 1);
 
         let synced = store.apply_gamedata_chat(
