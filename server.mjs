@@ -127,7 +127,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     #tui-view {
       flex: 1;
       display: grid;
-      grid-template-columns: minmax(340px, 48%) 26% 26%;
+      grid-template-columns: calc((100% - 12px) * 2 / 3) minmax(0, 1fr) minmax(0, 1fr);
       gap: 6px;
       padding: 6px;
       min-height: 0;

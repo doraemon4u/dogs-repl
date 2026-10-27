@@ -103,8 +103,8 @@ pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(board_pane_width(board_size).min(main.width)),
-            Constraint::Min(0),
+            Constraint::Ratio(2, 3),
+            Constraint::Ratio(1, 3),
         ])
         .split(main);
     let right = Layout::default()
@@ -193,7 +193,7 @@ mod tests {
     fn game_layout_fits_and_uses_a_fixed_board() {
         let area = Rect::new(0, 0, 120, 40);
         let layout = split_game(area, 19);
-        assert_eq!(layout.board.width, 45);
+        assert_eq!(layout.board.width, 80);
         assert_eq!(layout.board.x, 0);
         assert_eq!(layout.status.height, 1);
         assert_eq!(layout.input.height, 1);
