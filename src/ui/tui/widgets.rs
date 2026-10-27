@@ -735,13 +735,23 @@ pub fn draw_chat(
 
     // Channel pills bar
     let mut pills: Vec<Span> = Vec::new();
-    let current_norm = channel.trim_start_matches('#');
+    let canonical_key = crate::session::store::canonical_channel_key(channel);
+    let current_norm = canonical_key.trim_start_matches('#');
     for &ch in DEFAULT_CHAT_CHANNELS {
         let is_active = current_norm.eq_ignore_ascii_case(ch);
+        let unread = store
+            .channels
+            .get(ch)
+            .map(|st| st.unread)
+            .unwrap_or(0);
         let style = if is_active {
             Style::default()
                 .fg(theme.focus(theme.chat))
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if unread > 0 {
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD)
         } else if store.channels.contains_key(ch) {
             Style::default().fg(theme.chat)
         } else {
@@ -753,9 +763,20 @@ pub fn draw_chat(
         " [+More] ",
         Style::default().fg(theme.dim(theme.chat)),
     ));
+    let channel_state = store
+        .channels
+        .get(&canonical_key)
+        .or_else(|| store.channels.get(channel));
+    if let Some(state) = channel_state {
+        if !state.users.is_empty() {
+            pills.push(Span::styled(
+                format!(" · {} online", state.users.len()),
+                Style::default().fg(theme.muted),
+            ));
+        }
+    }
     frame.render_widget(Paragraph::new(Line::from(pills)), bar_area);
 
-    let channel_state = store.channels.get(channel);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(topic) = channel_state.and_then(|state| state.topic.clone()) {
         if !topic.is_empty() {
@@ -766,6 +787,18 @@ pub fn draw_chat(
         }
     }
     if let Some(state) = channel_state {
+        if !state.users.is_empty() {
+            let sample: Vec<&str> = state.users.values().map(String::as_str).take(8).collect();
+            let suffix = if state.users.len() > 8 { "…" } else { "" };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "users ({}): {}{suffix}",
+                    state.users.len(),
+                    sample.join(", ")
+                ),
+                Style::default().fg(theme.dim(theme.chat)),
+            )));
+        }
         for message in &state.messages {
             let line = match message.kind {
                 ChatKind::System => Line::from(Span::styled(
@@ -783,6 +816,12 @@ pub fn draw_chat(
                 ]),
             };
             lines.push(line);
+        }
+        if state.messages.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "synced with channel — waiting for new messages…",
+                Style::default().fg(theme.muted),
+            )));
         }
     } else {
         lines.push(Line::from(Span::styled(

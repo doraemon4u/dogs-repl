@@ -452,16 +452,18 @@ const HTML_PAGE = `<!DOCTYPE html>
   <script>
     const COLS = ['A','B','C','D','E','F','G','H','J','K','L','M','N','O','P','Q','R','S','T'];
     const DEFAULT_CHANNELS = [
-      { id: 'en', topic: 'English World Chat' },
-      { id: 'zh', topic: '中文围棋世界频道' },
-      { id: 'ja', topic: '日本語囲碁チャンネル' },
-      { id: 'ko', topic: '한국어 바둑 채널' },
-      { id: 'de', topic: 'Deutsch Go-Kanal' },
-      { id: 'fr', topic: 'Salon Go Francophone' },
-      { id: 'es', topic: 'Canal de Go en Español' },
-      { id: 'ru', topic: 'Русский канал Го' },
-      { id: 'pt', topic: 'Canal de Go em Português' },
-      { id: 'it', topic: 'Canale Go Italiano' }
+      { id: 'en', wire: 'global-english', topic: 'English World Chat' },
+      { id: 'zh', wire: 'global-zh-hans', topic: '中文围棋世界频道 (简体)' },
+      { id: 'zh-hant', wire: 'global-zh-hant', topic: '中文圍棋世界頻道 (繁體)' },
+      { id: 'ja', wire: 'global-japanese', topic: '日本語囲碁チャンネル' },
+      { id: 'ko', wire: 'global-korean', topic: '한국어 바둑 채널' },
+      { id: 'de', wire: 'global-german', topic: 'Deutsch Go-Kanal' },
+      { id: 'fr', wire: 'global-french', topic: 'Salon Go Francophone' },
+      { id: 'es', wire: 'global-spanish', topic: 'Canal de Go en Español' },
+      { id: 'ru', wire: 'global-russian', topic: 'Русский канал Го' },
+      { id: 'pt', wire: 'global-portuguese', topic: 'Canal de Go em Português' },
+      { id: 'it', wire: 'global-italian', topic: 'Canale Go Italiano' },
+      { id: 'help', wire: 'global-help', topic: 'Help & Questions' }
     ];
 
     const state = {
@@ -504,33 +506,47 @@ const HTML_PAGE = `<!DOCTYPE html>
       channelPickerIndex: 0,
       availableChannels: DEFAULT_CHANNELS.map(c => c.id),
       channels: {
-        'en': { joined: true, unread: 1, topic: 'English World Chat', messages: [
-          { kind: 'chat', author: 'nomad', text: 'Anyone up for a 19x19 or 9x9 teaching game?' },
-          { kind: 'chat', author: 'kisei_9d', text: "Use 'size 19' or 'channels zh' to switch board sizes or enter channels!" }
+        'en': { joined: true, unread: 1, wire: 'global-english', topic: 'English World Chat', users: ['nomad', 'kisei_9d', 'tenuki_4d', 'sora_2k', 'alice'], messages: [
+          { kind: 'chat', time: '14:18', author: 'tenuki_4d', text: '[history] Good morning from Europe! Any 19x19 games starting?' },
+          { kind: 'chat', time: '14:20', author: 'nomad', text: 'Anyone up for a 19x19 or 9x9 teaching game?' },
+          { kind: 'chat', time: '14:21', author: 'kisei_9d', text: "Use 'size 19' or 'channels zh' to switch board sizes or enter channels!" }
         ]},
-        'zh': { joined: true, unread: 0, topic: '中文围棋世界频道', messages: [
-          { kind: 'chat', author: 'weiqi_fan', text: '欢迎进入 #zh 中文围棋频道！支持 9x9 / 13x13 / 19x19 线条正方形棋盘与十字星位（╋）。' },
-          { kind: 'chat', author: 'guoli_9p', text: "在这里直接输入 'chat 你好' 或在聚焦聊天窗时直接打字即可发言。" }
+        'zh': { joined: true, unread: 2, wire: 'global-zh-hans', topic: '中文围棋世界频道 (简体)', users: ['weiqi_fan', 'guoli_9p', 'changhao_9p', 'kejie_fan', 'alice'], messages: [
+          { kind: 'chat', time: '14:15', author: 'changhao_9p', text: '[历史记录] 刚才那盘 19 路右下角的点三三变化很有意思。' },
+          { kind: 'chat', time: '14:19', author: 'weiqi_fan', text: '欢迎进入 #zh (global-zh-hans) 中文围棋频道！历史消息与在线棋友列表已实时同步。' },
+          { kind: 'chat', time: '14:22', author: 'guoli_9p', text: "在这里直接输入 'chat 你好' 或聚焦聊天窗打字即可与频道内其他棋友实时互动。" }
         ]},
-        'ja': { joined: false, unread: 0, topic: '日本語囲碁チャンネル', messages: [
-          { kind: 'chat', author: 'honinbo', text: '対局よろしくお願いします！ (#ja チャンネル)' }
+        'zh-hant': { joined: false, unread: 0, wire: 'global-zh-hant', topic: '中文圍棋世界頻道 (繁體)', users: ['taipei_go', 'haifong_7d'], messages: [
+          { kind: 'chat', time: '14:10', author: 'taipei_go', text: '[歷史訊息] 歡迎來到繁體中文圍棋頻道 (global-zh-hant)！' }
         ]},
-        'ko': { joined: false, unread: 0, topic: '한국어 바둑 채널', messages: [
-          { kind: 'chat', author: 'baduk_pro', text: '안녕하세요! #ko 채널에 오신 것을 환영합니다.' }
+        'ja': { joined: false, unread: 0, wire: 'global-japanese', topic: '日本語囲碁チャンネル', users: ['honinbo', 'meijin_8d', 'shibano'], messages: [
+          { kind: 'chat', time: '14:12', author: 'meijin_8d', text: '[履歴] こんにちは、今日も19路盤で対局しましょう。' },
+          { kind: 'chat', time: '14:16', author: 'honinbo', text: '対局よろしくお願いします！ (#ja / global-japanese)' }
         ]},
-        'de': { joined: false, unread: 0, topic: 'Deutsch Go-Kanal', messages: [
-          { kind: 'chat', author: 'berlin_go', text: 'Willkommen im deutschen Go-Kanal (#de)!' }
+        'ko': { joined: false, unread: 0, wire: 'global-korean', topic: '한국어 바둑 채널', users: ['baduk_pro', 'shin_9p'], messages: [
+          { kind: 'chat', time: '14:14', author: 'baduk_pro', text: '안녕하세요! #ko (global-korean) 채널에 오신 것을 환영합니다.' }
         ]},
-        'fr': { joined: false, unread: 0, topic: 'Salon Go Francophone', messages: [
-          { kind: 'chat', author: 'paris_atari', text: 'Bienvenue sur le canal francophone (#fr) !' }
+        'de': { joined: false, unread: 0, wire: 'global-german', topic: 'Deutsch Go-Kanal', users: ['berlin_go', 'munich_1d'], messages: [
+          { kind: 'chat', time: '14:09', author: 'berlin_go', text: 'Willkommen im deutschen Go-Kanal (#de / global-german)!' }
         ]},
-        'es': { joined: false, unread: 0, topic: 'Canal de Go en Español', messages: [] },
-        'ru': { joined: false, unread: 0, topic: 'Русский канал Го', messages: [] },
-        'pt': { joined: false, unread: 0, topic: 'Canal de Go em Português', messages: [] },
-        'it': { joined: false, unread: 0, topic: 'Canale Go Italiano', messages: [] },
-        'game/42': { joined: true, unread: 0, topic: 'Game #42 alice vs bob', messages: [
+        'fr': { joined: false, unread: 0, wire: 'global-french', topic: 'Salon Go Francophone', users: ['paris_atari', 'lyon_3k'], messages: [
+          { kind: 'chat', time: '14:11', author: 'paris_atari', text: 'Bienvenue sur le canal francophone (#fr / global-french) !' }
+        ]},
+        'es': { joined: false, unread: 0, wire: 'global-spanish', topic: 'Canal de Go en Español', users: ['madrid_go'], messages: [
+          { kind: 'chat', time: '14:05', author: 'madrid_go', text: '¡Bienvenidos al canal de Go en español (global-spanish)!' }
+        ]},
+        'ru': { joined: false, unread: 0, wire: 'global-russian', topic: 'Русский канал Го', users: ['moscow_dan'], messages: [
+          { kind: 'chat', time: '14:06', author: 'moscow_dan', text: 'Добро пожаловать в русский канал Го (global-russian)!' }
+        ]},
+        'pt': { joined: false, unread: 0, wire: 'global-portuguese', topic: 'Canal de Go em Português', users: ['lisboa_go'], messages: [] },
+        'it': { joined: false, unread: 0, wire: 'Canale Go Italiano', users: ['roma_tesuji'], messages: [] },
+        'help': { joined: false, unread: 0, wire: 'global-help', topic: 'Help & Questions', users: ['ogs_mod', 'helper_5d'], messages: [
+          { kind: 'chat', time: '14:00', author: 'ogs_mod', text: 'Ask any OGS rules or client questions here in #help (global-help).' }
+        ]},
+        'game/42': { joined: true, unread: 0, wire: 'game/42', topic: 'Game #42 alice vs bob', users: ['alice', 'bob'], messages: [
           { kind: 'sys', author: '', text: 'loaded Game #42 (9x9, japanese, komi 5.5, byo-yomi 10:00 + 5x0:30)' },
-          { kind: 'chat', author: 'alice', text: "glhf! Try 9×9 / 13×13 / 19×19 buttons, 'preset ko', or click 'channels' to enter #zh / #en / #ja." }
+          { kind: 'chat', time: '14:17', author: 'bob', text: '[gamedata.chat] Hi alice, have a nice game!' },
+          { kind: 'chat', time: '14:18', author: 'alice', text: "glhf! Try 9×9 / 13×13 / 19×19 buttons, 'preset ko', or click 'channels' to enter #zh / #en / #ja." }
         ]}
       },
       logs: [
@@ -539,13 +555,17 @@ const HTML_PAGE = `<!DOCTYPE html>
     };
 
     function ensureChannel(chId) {
-      const clean = chId.replace(/^#/, '').toLowerCase();
+      let clean = chId.replace(/^#/, '').toLowerCase();
+      const byWire = DEFAULT_CHANNELS.find(d => d.wire === clean);
+      if (byWire) clean = byWire.id;
       if (!state.channels[clean]) {
         const meta = DEFAULT_CHANNELS.find(d => d.id === clean);
         state.channels[clean] = {
           joined: false,
           unread: 0,
+          wire: meta ? meta.wire : 'global-' + clean,
           topic: meta ? meta.topic : 'World channel #' + clean,
+          users: ['alice'],
           messages: []
         };
       }
@@ -565,13 +585,14 @@ const HTML_PAGE = `<!DOCTYPE html>
       state.focus = 'chat';
       state.showChannelPicker = false;
       if (!wasJoined) {
+        const uCount = (state.channels[ch].users || []).length;
         state.channels[ch].messages.push({
           kind: 'sys',
           author: '',
-          text: \`已加入并进入世界频道 #\${ch} (\${state.channels[ch].topic})\`
+          text: \`synced OGS channel #\${ch} (\${state.channels[ch].wire || ch}) · \${uCount} users online · earlier chat history loaded\`
         });
       }
-      pushLog('ok', \`entered world channel #\${ch} (\${state.channels[ch].topic}) — type 'chat <msg>' or type directly to talk\`, false);
+      pushLog('ok', \`entered & synced world channel #\${ch} (\${state.channels[ch].wire || ch}) — earlier history & live chat-message stream active\`, false);
       updateFocusClasses();
       render();
     }
@@ -1477,13 +1498,18 @@ const HTML_PAGE = `<!DOCTYPE html>
 
       let chatHtml = '';
       if (chObj.topic) {
-        chatHtml += \`<div style="color:var(--muted)">topic: \${chObj.topic} (\${state.chatScope === 'game' ? '对局聊天' : '世界频道 #' + state.worldChannel})</div>\`;
+        const wireTag = chObj.wire ? \` [\${chObj.wire}]\` : '';
+        chatHtml += \`<div style="color:var(--muted)">topic: \${chObj.topic}\${wireTag}</div>\`;
+      }
+      if (chObj.users && chObj.users.length) {
+        chatHtml += \`<div style="color:var(--muted);font-size:11px;margin-bottom:4px">users (\${chObj.users.length}): \${chObj.users.join(', ')}</div>\`;
       }
       for (const m of chObj.messages) {
         if (m.kind === 'sys') {
           chatHtml += \`<div class="sys-msg">· \${m.text}</div>\`;
         } else {
-          chatHtml += \`<div><strong style="color:var(--chat)">\${m.author}:</strong> \${m.text}</div>\`;
+          const tSpan = m.time ? \`<span style="color:var(--muted);font-size:11px;margin-right:4px">\${m.time}</span>\` : '';
+          chatHtml += \`<div>\${tSpan}<strong style="color:var(--chat)">\${m.author}:</strong> \${m.text}</div>\`;
         }
       }
       const chatBody = document.getElementById('chat-body');

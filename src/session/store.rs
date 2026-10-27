@@ -830,7 +830,7 @@ impl Store {
     pub fn apply_chat_channels(&mut self, value: &Value) {
         let mut names = Vec::new();
         let mut add_channel = |name: String, topic: Option<String>, store: &mut Self| {
-            let trimmed = name.trim().trim_start_matches('#').to_string();
+            let trimmed = canonical_channel_key(&name);
             if trimmed.is_empty() {
                 return;
             }
@@ -919,6 +919,191 @@ fn value_as_string(value: &Value) -> Option<String> {
         Value::Number(number) => Some(number.to_string()),
         _ => None,
     }
+}
+
+/// Extracts the author username from any OGS chat payload (`chat-message`, `game/:id/chat`, `private-message`).
+pub fn extract_chat_author(value: &Value) -> String {
+    if let Some(name) = value.get("username").and_then(Value::as_str) {
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+    if let Some(line) = value.get("line") {
+        if let Some(name) = line.get("username").and_then(Value::as_str) {
+            if !name.is_empty() {
+                return name.to_string();
+            }
+        }
+    }
+    for key in ["from", "user", "player"] {
+        if let Some(entry) = value.get(key) {
+            if let Some(name) = entry
+                .get("username")
+                .or_else(|| entry.get("name"))
+                .and_then(Value::as_str)
+                .or_else(|| entry.as_str())
+            {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+    }
+    if value.get("system").and_then(Value::as_bool) == Some(true) {
+        return "system".to_string();
+    }
+    String::new()
+}
+
+/// Extracts the message text from any OGS chat payload shape:
+/// * `{"message": {"i": "...", "t": 1729..., "m": "hello"}}` (`chat-message` / `private-message`)
+/// * `{"message": {"m": {"type": "analysis", "name": "...", "text": "..."}}}` (structured chat)
+/// * `{"line": {"body": "hello", ...}}` (`game/:id/chat`)
+/// * `{"text": "hello"}` or `{"message": "hello"}` or `{"body": "hello"}`
+pub fn extract_chat_text(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        return (!trimmed.is_empty()).then(|| trimmed.to_string());
+    }
+
+    // 1. Check `message` field (OGS `chat-message` object `{i, t, m}` or string)
+    if let Some(msg) = value.get("message") {
+        if let Some(s) = msg.as_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        } else if msg.is_object() {
+            if let Some(m) = msg.get("m") {
+                if let Some(s) = m.as_str() {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                } else if m.is_object() {
+                    if let Some(s) = extract_structured_chat_body(m) {
+                        return Some(s);
+                    }
+                }
+            }
+            for key in ["message", "body", "text"] {
+                if let Some(s) = msg.get(key).and_then(Value::as_str) {
+                    let trimmed = s.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Check `line` field (OGS `game/:id/chat` object `{chat_id, username, body, ...}`)
+    if let Some(line) = value.get("line") {
+        if let Some(s) = extract_chat_text(line) {
+            return Some(s);
+        }
+    }
+
+    // 3. Check `body` or `text` field directly
+    for key in ["text", "body"] {
+        if let Some(field) = value.get(key) {
+            if let Some(s) = field.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            } else if field.is_object() {
+                if let Some(s) = extract_structured_chat_body(field) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+
+    // 4. System message fallback (e.g. flood protection)
+    if let Some(sys_type) = value.get("system_message_type").and_then(Value::as_str) {
+        return Some(format!("[system: {sys_type}]"));
+    }
+
+    None
+}
+
+fn extract_structured_chat_body(obj: &Value) -> Option<String> {
+    for key in ["text", "translated", "source", "body", "m"] {
+        if let Some(s) = obj.get(key).and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let kind = obj.get("type").and_then(Value::as_str).unwrap_or_default();
+    let name = obj.get("name").and_then(Value::as_str).unwrap_or_default();
+    if kind == "analysis" {
+        if !name.is_empty() {
+            return Some(format!("[analysis: {name}]"));
+        }
+        return Some("[shared analysis variation]".to_string());
+    }
+    if kind == "review" {
+        let review_id = obj.get("review_id").and_then(Value::as_i64).unwrap_or(0);
+        return Some(format!("[review #{review_id}]"));
+    }
+    if !name.is_empty() {
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// Extracts the server message UUID (`message.i`, `chat_id`, or `uuid`) for deduplication.
+pub fn extract_chat_id(value: &Value) -> Option<String> {
+    if let Some(id) = value
+        .get("message")
+        .and_then(|m| m.get("i"))
+        .and_then(value_as_string)
+    {
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    if let Some(id) = value
+        .get("line")
+        .and_then(|l| l.get("chat_id").or_else(|| l.get("id")))
+        .and_then(value_as_string)
+    {
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    for key in ["chat_id", "uuid", "uid", "i"] {
+        if let Some(id) = value.get(key).and_then(value_as_string) {
+            if !id.is_empty() {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+/// Extracts the server timestamp (`message.t`, `line.date`, `date`, or `timestamp`) if present.
+pub fn extract_chat_timestamp(value: &Value) -> Option<u64> {
+    value
+        .get("message")
+        .and_then(|m| m.get("t"))
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("line")
+                .and_then(|l| l.get("date").or_else(|| l.get("t")))
+                .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            value
+                .get("date")
+                .or_else(|| value.get("timestamp"))
+                .or_else(|| value.get("t"))
+                .and_then(Value::as_u64)
+        })
 }
 
 fn player_name(value: Option<&Value>) -> String {
@@ -1837,5 +2022,139 @@ mod tests {
             store.channels["en"].topic.as_deref(),
             Some("English chat")
         );
+    }
+
+    #[test]
+    fn ogs_wire_channel_mapping_and_canonical_key_roundtrip() {
+        assert_eq!(to_ogs_wire_channel("en"), "global-english");
+        assert_eq!(to_ogs_wire_channel("#zh"), "global-zh-hans");
+        assert_eq!(to_ogs_wire_channel("zh-hant"), "global-zh-hant");
+        assert_eq!(to_ogs_wire_channel("ja"), "global-japanese");
+        assert_eq!(to_ogs_wire_channel("ko"), "global-korean");
+        assert_eq!(to_ogs_wire_channel("help"), "global-help");
+        assert_eq!(to_ogs_wire_channel("global-english"), "global-english");
+
+        assert_eq!(canonical_channel_key("global-english"), "en");
+        assert_eq!(canonical_channel_key("global-zh-hans"), "zh");
+        assert_eq!(canonical_channel_key("global-zh-hant"), "zh-hant");
+        assert_eq!(canonical_channel_key("global-japanese"), "ja");
+        assert_eq!(canonical_channel_key("#EN"), "en");
+        assert_eq!(canonical_channel_key("game/42"), "game/42");
+    }
+
+    #[test]
+    fn extract_chat_fields_handles_ogs_nested_message_and_game_line() {
+        let world_payload = json!({
+            "channel": "global-zh-hans",
+            "user": { "id": 101, "username": "guoli_9p", "ranking": 36 },
+            "message": {
+                "i": "uuid-1234",
+                "t": 1_729_000_000,
+                "m": "大家好，欢迎来到中文频道！"
+            }
+        });
+        assert_eq!(extract_chat_author(&world_payload), "guoli_9p");
+        assert_eq!(
+            extract_chat_text(&world_payload).as_deref(),
+            Some("大家好，欢迎来到中文频道！")
+        );
+        assert_eq!(extract_chat_id(&world_payload).as_deref(), Some("uuid-1234"));
+        assert!(extract_chat_timestamp(&world_payload).is_some());
+
+        let game_chat_payload = json!({
+            "channel": "main",
+            "line": {
+                "chat_id": "gchat-99",
+                "username": "bob",
+                "body": "good game!",
+                "date": 1_729_000_120
+            }
+        });
+        assert_eq!(extract_chat_author(&game_chat_payload), "bob");
+        assert_eq!(
+            extract_chat_text(&game_chat_payload).as_deref(),
+            Some("good game!")
+        );
+        assert_eq!(
+            extract_chat_id(&game_chat_payload).as_deref(),
+            Some("gchat-99")
+        );
+    }
+
+    #[test]
+    fn push_chat_meta_deduplicates_uuid_and_upgrades_optimistic_echo() {
+        let mut store = Store::new("zh");
+        store.session.username = Some("alice".to_string());
+        store.chat_scope = ChatScope::World;
+
+        // Optimistic echo when user sends a message locally
+        store.push_chat_system("zh", "you: 你好 OGS");
+        assert_eq!(store.channels["zh"].messages.len(), 1);
+        assert!(store.channels["zh"].messages[0].system);
+
+        // Server echoes back the real chat-message with uuid
+        let inserted = store.push_chat_meta(
+            "global-zh-hans",
+            "alice",
+            "你好 OGS",
+            Some("msg-uuid-1".to_string()),
+            None,
+        );
+        assert!(inserted);
+        assert_eq!(store.channels["zh"].messages.len(), 1);
+        assert!(!store.channels["zh"].messages[0].system);
+        assert_eq!(store.channels["zh"].messages[0].author, "alice");
+
+        // Duplicate replay of same msg-uuid-1 is ignored
+        let duplicate = store.push_chat_meta(
+            "global-zh-hans",
+            "alice",
+            "你好 OGS",
+            Some("msg-uuid-1".to_string()),
+            None,
+        );
+        assert!(!duplicate);
+        assert_eq!(store.channels["zh"].messages.len(), 1);
+    }
+
+    #[test]
+    fn channel_join_part_and_gamedata_chat_history_sync() {
+        let mut store = Store::new("en");
+        let added = store.apply_channel_join(
+            "global-english",
+            &json!({
+                "channel": "global-english",
+                "users": [
+                    { "id": 1, "username": "nomad" },
+                    { "id": 2, "username": "kisei" }
+                ]
+            }),
+        );
+        assert_eq!(added, 2);
+        assert!(store.channels["en"].joined);
+        assert_eq!(store.channels["en"].users.len(), 2);
+
+        store.apply_channel_part(
+            "global-english",
+            &json!({
+                "channel": "global-english",
+                "user": { "id": 1, "username": "nomad" }
+            }),
+        );
+        assert_eq!(store.channels["en"].users.len(), 1);
+
+        let synced = store.apply_gamedata_chat(
+            42,
+            &json!({
+                "chat": [
+                    { "chat_id": "c1", "username": "alice", "body": "hi!" },
+                    { "chat_id": "c2", "username": "bob", "body": "have fun!" }
+                ]
+            }),
+        );
+        assert_eq!(synced, 2);
+        assert_eq!(store.channels["game/42"].messages.len(), 2);
+        assert_eq!(store.channels["game/42"].messages[0].author, "alice");
+        assert_eq!(store.channels["game/42"].messages[1].text, "have fun!");
     }
 }

@@ -335,6 +335,7 @@ impl Actor {
                 state.set_chat_scope(scope);
             }
             Command::JoinChannel(channel) => {
+                let channel = crate::session::store::canonical_channel_key(&channel);
                 if let Some(realtime) = &self.realtime {
                     realtime.chat_join(&channel);
                 }
@@ -345,11 +346,15 @@ impl Actor {
                 }
                 self.log(
                     LogLevel::Success,
-                    format!("joined and entered #{channel}"),
+                    format!(
+                        "joined and entered #{channel} (wire: {})",
+                        crate::session::store::to_ogs_wire_channel(&channel)
+                    ),
                 )
                 .await;
             }
             Command::PartChannel(channel) => {
+                let channel = crate::session::store::canonical_channel_key(&channel);
                 if let Some(realtime) = &self.realtime {
                     realtime.chat_part(&channel);
                 }
@@ -969,40 +974,37 @@ impl Actor {
     }
 
     async fn set_world_channel(&mut self, channel: String) {
-        let (old, was_joined) = {
+        let channel = crate::session::store::canonical_channel_key(&channel);
+        let (old, already_joined) = {
             let state = self.state.read().await;
             let old = state.world_channel.clone();
             let joined = state
                 .channels
-                .get(&old)
-                .map(|channel| channel.joined)
+                .get(&channel)
+                .map(|ch| ch.joined)
                 .unwrap_or(false);
             (old, joined)
         };
-        if old == channel {
-            self.state
-                .write()
-                .await
-                .set_chat_scope(crate::session::store::ChatScope::world(&channel));
-            return;
-        }
         if let Some(realtime) = &self.realtime {
-            if was_joined {
-                realtime.chat_part(&old);
-            }
+            // Always send chat/join when switching to a channel so OGS syncs
+            // recent history and online user list if not yet subscribed.
             realtime.chat_join(&channel);
         }
         {
             let mut state = self.state.write().await;
             state.set_world_channel(&channel);
             state.set_channel_joined(&channel, true);
-            state.set_channel_joined(&old, false);
         }
-        self.log(
-            LogLevel::Info,
-            format!("world channel switched to #{channel}"),
-        )
-        .await;
+        if old != channel || !already_joined {
+            self.log(
+                LogLevel::Info,
+                format!(
+                    "world channel switched to #{channel} (wire: {})",
+                    crate::session::store::to_ogs_wire_channel(&channel)
+                ),
+            )
+            .await;
+        }
     }
 
     // --------------------------------------------------- sgf & review cursor
@@ -1393,6 +1395,58 @@ impl Actor {
                     .await;
                 self.state.write().await.push_chat(&channel, &author, &text);
             }
+            RealtimeEvent::ChatJoin { channel, users } => {
+                self.event_bus
+                    .publish(
+                        "chat-join",
+                        &json!({"channel": channel, "count": users.len()}),
+                    )
+                    .await;
+                self.state
+                    .write()
+                    .await
+                    .apply_channel_join(&channel, &users);
+            }
+            RealtimeEvent::ChatPart {
+                channel,
+                user_id,
+                username,
+            } => {
+                self.event_bus
+                    .publish(
+                        "chat-part",
+                        &json!({"channel": channel, "user_id": user_id, "username": username}),
+                    )
+                    .await;
+                self.state
+                    .write()
+                    .await
+                    .apply_channel_part(&channel, user_id, &username);
+            }
+            RealtimeEvent::ChatTopic { channel, topic } => {
+                self.event_bus
+                    .publish(
+                        "chat-topic",
+                        &json!({"channel": channel, "topic": topic}),
+                    )
+                    .await;
+                self.state
+                    .write()
+                    .await
+                    .apply_channel_topic(&channel, &topic);
+            }
+            RealtimeEvent::ChatRemoved { channel, uuid } => {
+                self.event_bus
+                    .publish(
+                        "chat-message-removed",
+                        &json!({"channel": channel, "uuid": uuid}),
+                    )
+                    .await;
+                self.state
+                    .write()
+                    .await
+                    .remove_chat_message(&channel, &uuid);
+            }
             RealtimeEvent::GameEvent { event, data } => {
                 self.event_bus.publish(&event, &data).await;
                 self.handle_game_event(&event, data).await;
@@ -1421,14 +1475,31 @@ impl Actor {
     }
 
     async fn join_world_channel(&mut self) {
-        let channel = self.state.read().await.world_channel.clone();
+        let channels_to_join: Vec<String> = {
+            let state = self.state.read().await;
+            let mut list = vec![state.world_channel.clone()];
+            for (name, ch) in &state.channels {
+                if ch.joined && !name.starts_with("game/") && !list.contains(name) {
+                    list.push(name.clone());
+                }
+            }
+            // Also subscribe to #zh alongside #en so Chinese & English global chat
+            // history and live messages stay synchronized.
+            let zh = "zh".to_string();
+            if !list.contains(&zh) {
+                list.push(zh);
+            }
+            list
+        };
         if let Some(realtime) = &self.realtime {
-            realtime.chat_join(&channel);
+            for ch in &channels_to_join {
+                realtime.chat_join(ch);
+            }
         }
-        self.state
-            .write()
-            .await
-            .set_channel_joined(&channel, true);
+        let mut state = self.state.write().await;
+        for ch in channels_to_join {
+            state.set_channel_joined(&ch, true);
+        }
     }
 
     async fn handle_game_event(&mut self, event: &str, data: Value) {
@@ -1461,6 +1532,7 @@ impl Actor {
                         }
                     }
                     state.games.insert(game_id, view);
+                    state.apply_gamedata_chat(game_id, &payload);
                     drop(state);
                     self.log(LogLevel::Info, format!("game {game_id}: {title}"))
                         .await;
@@ -1530,19 +1602,31 @@ impl Actor {
                     .await;
             }
             "chat" => {
-                let author = data
-                    .get("username")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let text = data
-                    .get("text")
-                    .or_else(|| data.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                self.state
+                let author = crate::session::store::extract_chat_author(&data);
+                if let Some(text) = crate::session::store::extract_chat_text(&data) {
+                    let msg_id = crate::session::store::extract_chat_id(&data);
+                    let ts = crate::session::store::extract_chat_timestamp(&data);
+                    self.state.write().await.push_chat_meta(
+                        &game_channel(game_id),
+                        &author,
+                        &text,
+                        msg_id,
+                        ts,
+                        true,
+                    );
+                }
+            }
+            "reset-chats" => {
+                if let Some(ch) = self
+                    .state
                     .write()
                     .await
-                    .push_chat(&game_channel(game_id), author, text);
+                    .channels
+                    .get_mut(&game_channel(game_id))
+                {
+                    ch.messages.clear();
+                    ch.seen_ids.clear();
+                }
             }
             "resign" | "ended" | "game_ends" => {
                 let result = data
@@ -1957,6 +2041,9 @@ impl Actor {
         {
             let mut state = self.state.write().await;
             state.games.insert(game_id, view);
+            if let Ok(ref rest_val) = rest {
+                state.apply_gamedata_chat(game_id, rest_val);
+            }
         }
         if let Some(warning) = warning {
             self.log(LogLevel::Warning, warning).await;

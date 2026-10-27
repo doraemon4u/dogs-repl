@@ -79,6 +79,27 @@ pub enum RealtimeEvent {
         author: String,
         text: String,
     },
+    /// Users joined or present in a chat channel (`chat-join` / `chat-update-user`).
+    ChatJoin {
+        channel: String,
+        users: Vec<(i64, String)>,
+    },
+    /// A user left a chat channel (`chat-part`).
+    ChatPart {
+        channel: String,
+        user_id: i64,
+        username: String,
+    },
+    /// Channel topic updated (`chat-topic`).
+    ChatTopic {
+        channel: String,
+        topic: String,
+    },
+    /// A chat message was removed (`chat-message-removed`).
+    ChatRemoved {
+        channel: String,
+        uuid: String,
+    },
     /// Any `game/<id>/...` push, with the full event name.
     GameEvent { event: String, data: Value },
     /// Correlated reply to a request, resolved through its rid.
@@ -117,6 +138,7 @@ struct Inner {
     socket: Arc<RwLock<Option<Client>>>,
     next_rid: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, String>>>,
+    seen_chat_ids: Mutex<std::collections::HashSet<String>>,
     /// Ordered outbound queue. `tokio::spawn`-per-message would allow a
     /// `game/move` to overtake the `authenticate` that authorises it.
     out_tx: UnboundedSender<Outbound>,
@@ -135,6 +157,7 @@ impl Inner {
             socket: Arc::new(RwLock::new(None)),
             next_rid: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            seen_chat_ids: Mutex::new(std::collections::HashSet::new()),
             out_tx,
             out_rx: Mutex::new(Some(out_rx)),
             worker_started: AtomicBool::new(false),
@@ -312,58 +335,166 @@ impl Inner {
                 self.send_authenticated(&data);
                 return;
             }
-            "chat" | "chat-message" => RealtimeEvent::Chat {
-                channel: data
+            "chat" | "chat-message" => {
+                if let Some(msg_id) = crate::session::store::extract_chat_id(&data) {
+                    let mut seen = self
+                        .seen_chat_ids
+                        .lock()
+                        .expect("seen_chat_ids mutex poisoned");
+                    if !seen.insert(msg_id) {
+                        return;
+                    }
+                    if seen.len() > 4000 {
+                        seen.clear();
+                    }
+                }
+                let raw_channel = data
                     .get("channel")
                     .and_then(Value::as_str)
-                    .unwrap_or("world")
-                    .trim_start_matches('#')
-                    .to_string(),
-                author: data
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let author = crate::session::store::extract_chat_author(&data);
+                let Some(text) = crate::session::store::extract_chat_text(&data) else {
+                    return;
+                };
+                RealtimeEvent::Chat {
+                    channel,
+                    author,
+                    text,
+                }
+            }
+            "chat-join" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let users = data
+                    .get("users")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|u| {
+                                let id = u.get("id").and_then(Value::as_i64).unwrap_or(0);
+                                let name = u
+                                    .get("username")
+                                    .or_else(|| u.get("name"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                (!name.is_empty()).then_some((id, name))
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                RealtimeEvent::ChatJoin { channel, users }
+            }
+            "chat-update-user" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let users = data
+                    .get("user")
+                    .and_then(|u| {
+                        let id = u.get("id").and_then(Value::as_i64).unwrap_or(0);
+                        let name = u
+                            .get("username")
+                            .or_else(|| u.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        (!name.is_empty()).then_some(vec![(id, name)])
+                    })
+                    .unwrap_or_default();
+                RealtimeEvent::ChatJoin { channel, users }
+            }
+            "chat-part" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let user = data.get("user").unwrap_or(&data);
+                let user_id = user.get("id").and_then(Value::as_i64).unwrap_or(0);
+                let username = user
                     .get("username")
+                    .or_else(|| user.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-                text: data
-                    .get("text")
-                    .or_else(|| data.get("message"))
+                    .to_string();
+                RealtimeEvent::ChatPart {
+                    channel,
+                    user_id,
+                    username,
+                }
+            }
+            "chat-topic" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let topic = data
+                    .get("topic")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
-                    .to_string(),
-            },
+                    .to_string();
+                RealtimeEvent::ChatTopic { channel, topic }
+            }
+            "chat-message-removed" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let uuid = data
+                    .get("uuid")
+                    .or_else(|| data.get("chat_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                RealtimeEvent::ChatRemoved { channel, uuid }
+            }
             "private-message" | "private-superchat" => {
-                let author = data
-                    .get("from")
-                    .and_then(|u| u.get("username"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("private")
-                    .to_string();
-                let text = data
-                    .get("message")
-                    .and_then(|m| m.get("message").or_else(|| m.get("body")))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
+                let author = {
+                    let extracted = crate::session::store::extract_chat_author(&data);
+                    if extracted.is_empty() {
+                        "private".to_string()
+                    } else {
+                        extracted
+                    }
+                };
+                let Some(text) = crate::session::store::extract_chat_text(&data) else {
+                    return;
+                };
                 RealtimeEvent::Chat {
                     channel: format!("pm:{}", author),
                     author,
                     text,
                 }
             }
-            name if name.ends_with("/chat") => RealtimeEvent::Chat {
-                channel: name.trim_end_matches("/chat").to_string(),
-                author: data
-                    .get("username")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                text: data
-                    .get("text")
-                    .or_else(|| data.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            },
+            name if name.ends_with("/chat") => {
+                if let Some(msg_id) = crate::session::store::extract_chat_id(&data) {
+                    let mut seen = self
+                        .seen_chat_ids
+                        .lock()
+                        .expect("seen_chat_ids mutex poisoned");
+                    if !seen.insert(msg_id) {
+                        return;
+                    }
+                }
+                let author = crate::session::store::extract_chat_author(&data);
+                let Some(text) = crate::session::store::extract_chat_text(&data) else {
+                    return;
+                };
+                RealtimeEvent::Chat {
+                    channel: name.trim_end_matches("/chat").to_string(),
+                    author,
+                    text,
+                }
+            }
             name if name.starts_with("game/") => RealtimeEvent::GameEvent {
                 event: name.to_string(),
                 data,
@@ -618,29 +749,41 @@ impl RealtimeClient {
         );
     }
 
-    /// `chat/join` — subscribes to a world chat channel.
+    /// `chat/join` — subscribes to a world chat channel (mapping short aliases like `"en"` to `"global-english"`).
     pub fn chat_join(&self, channel: &str) {
-        self.inner.notify("chat/join", json!({ "channel": channel }));
+        let wire = crate::session::store::to_ogs_wire_channel(channel);
+        self.inner.notify("chat/join", json!({ "channel": wire }));
+        let raw = channel.trim().trim_start_matches('#');
+        if !raw.is_empty() && raw != wire {
+            self.inner.notify("chat/join", json!({ "channel": raw }));
+        }
     }
 
     /// `chat/part` — leaves a world chat channel.
     pub fn chat_part(&self, channel: &str) {
-        self.inner.notify("chat/part", json!({ "channel": channel }));
+        let wire = crate::session::store::to_ogs_wire_channel(channel);
+        self.inner.notify("chat/part", json!({ "channel": wire }));
+        let raw = channel.trim().trim_start_matches('#');
+        if !raw.is_empty() && raw != wire {
+            self.inner.notify("chat/part", json!({ "channel": raw }));
+        }
     }
 
     /// `chat/send` — posts to a world chat channel.
     pub fn send_chat(&self, channel: &str, message: &str) {
+        let wire = crate::session::store::to_ogs_wire_channel(channel);
         let uuid = self.next_uuid();
         self.inner.notify(
             "chat/send",
-            json!({ "channel": channel, "uuid": uuid, "message": message }),
+            json!({ "channel": wire, "uuid": uuid, "message": message }),
         );
     }
 
     /// `chat/topic` — changes a channel topic.
     pub fn chat_topic(&self, channel: &str, topic: &str) {
+        let wire = crate::session::store::to_ogs_wire_channel(channel);
         self.inner
-            .request("chat/topic", json!({ "channel": channel, "topic": topic }));
+            .request("chat/topic", json!({ "channel": wire, "topic": topic }));
     }
 
     /// `user/monitor` — subscribes to presence changes of these player ids.
@@ -1221,5 +1364,93 @@ mod tests {
         assert_eq!(GameList::Live.as_str(), "live");
         assert_eq!(GameList::Corr.as_str(), "corr");
         assert_eq!(GameList::Kidsgo.as_str(), "kidsgo");
+    }
+
+    #[test]
+    fn ogs_nested_chat_message_and_channel_events_are_dispatched() {
+        let (inner, mut events) = inner();
+
+        // 1. OGS `chat-message` with nested `message: { i, t, m }` on `global-zh-hans`
+        inner.dispatch(
+            Event::from("chat-message"),
+            Payload::Text(vec![json!({
+                "channel": "global-zh-hans",
+                "user": { "id": 7, "username": "weiqi_fan", "ranking": 30 },
+                "message": {
+                    "i": "uuid-abc",
+                    "t": 1_729_000_000,
+                    "m": "有人来一盘 19 路吗？"
+                }
+            })]),
+        );
+        match events.try_recv().unwrap() {
+            RealtimeEvent::Chat {
+                channel,
+                author,
+                text,
+            } => {
+                assert_eq!(channel, "zh");
+                assert_eq!(author, "weiqi_fan");
+                assert_eq!(text, "有人来一盘 19 路吗？");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 2. OGS `chat-join`
+        inner.dispatch(
+            Event::from("chat-join"),
+            Payload::Text(vec![json!({
+                "channel": "global-english",
+                "users": [{ "id": 1, "username": "nomad" }]
+            })]),
+        );
+        match events.try_recv().unwrap() {
+            RealtimeEvent::ChatJoin { channel, data } => {
+                assert_eq!(channel, "en");
+                assert_eq!(data["users"][0]["username"], json!("nomad"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 3. OGS `chat-topic`
+        inner.dispatch(
+            Event::from("chat-topic"),
+            Payload::Text(vec![json!({
+                "channel": "global-english",
+                "topic": "Welcome to OGS English Channel"
+            })]),
+        );
+        match events.try_recv().unwrap() {
+            RealtimeEvent::ChatTopic { channel, topic } => {
+                assert_eq!(channel, "en");
+                assert_eq!(topic, "Welcome to OGS English Channel");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // 4. OGS `game/:id/chat` with nested `line: { username, body }`
+        inner.dispatch(
+            Event::from("game/42/chat"),
+            Payload::Text(vec![json!({
+                "channel": "main",
+                "line": {
+                    "chat_id": "line-1",
+                    "username": "alice",
+                    "body": "gg thanks!"
+                }
+            })]),
+        );
+        match events.try_recv().unwrap() {
+            RealtimeEvent::Chat {
+                channel,
+                author,
+                text,
+            } => {
+                assert_eq!(channel, "game/42");
+                assert_eq!(author, "alice");
+                assert_eq!(text, "gg thanks!");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }
