@@ -152,66 +152,173 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
     }
 }
 
-/// Computes the optimal integer scaling factor S so 9x9 and 13x13 boards stretch
-/// to fill the available pane cleanly while keeping square cells (col_step = 2 * S, row_step = S).
-pub fn compute_board_scale(area: Rect, size: u8) -> u16 {
-    if size == 0 {
-        return 1;
+/// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
+pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
+    let rx = if col_step >= 5 {
+        2
+    } else if col_step >= 3 {
+        1
+    } else {
+        0
+    };
+    let ry = if row_step >= 2 && col_step >= 3 {
+        1
+    } else {
+        0
+    };
+    (rx, ry)
+}
+
+/// Computes optimal `(col_step, row_step)` so 9x9, 13x13, and 19x19 boards all expand
+/// to fill the 2/3 board pane and render proportional multi-character stones.
+pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
+    if size <= 1 {
+        return (2, 1);
     }
-    let mut best_scale = 1;
-    for s in 1..=8 {
-        let needed_h = u16::from(size.saturating_sub(1)) * s + 3;
-        let needed_w = u16::from(size.saturating_sub(1)) * (2 * s) + LABEL_WIDTH * 2 + 1;
-        if needed_h <= area.height && needed_w <= area.width {
-            best_scale = s;
+    let gaps = u16::from(size - 1);
+
+    // Find maximum horizontal step that fits `area.width`
+    let mut max_col = 2u16;
+    for c in 2..=12 {
+        let rx = if c >= 5 { 2 } else if c >= 3 { 1 } else { 0 };
+        let needed_w = LABEL_WIDTH + rx + gaps * c + rx + 1;
+        if needed_w <= area.width {
+            max_col = c;
         } else {
             break;
         }
     }
-    best_scale
+
+    // Find maximum vertical step that fits `area.height`
+    let mut max_row = 1u16;
+    for r in 1..=6 {
+        let needed_h = if r >= 3 {
+            gaps * r + 4
+        } else if r == 2 {
+            // Allow 19x19 (gaps=18 -> 36+1=37) to enter 2D stone mode in standard full-screen terminals
+            gaps * r + 1
+        } else {
+            gaps * r + 2
+        };
+        let min_col_for_r = if r == 2 { 3 } else { r * 2 };
+        if needed_h <= area.height && max_col >= min_col_for_r {
+            max_row = r;
+        } else {
+            break;
+        }
+    }
+
+    let row_step = max_row.max(1);
+    let col_step = if row_step == 1 {
+        // When vertical height limits row_step to 1 (e.g. 19x19 on shorter terminals),
+        // still expand horizontally up to 5 cols per step so 19x19 fills the pane and uses 3..5-col stones.
+        max_col.clamp(2, 5)
+    } else if row_step == 2 {
+        // For row_step == 2 (19x19 or 13x13), expand up to 6 cols per step so 5x3 stones can be used on wide screens
+        max_col.clamp(3, 6)
+    } else {
+        // For row_step >= 3 (9x9 or 13x13), keep ~2:1 aspect ratio
+        (row_step * 2 + 2).min(max_col).max(row_step * 2).min(max_col)
+    };
+
+    (col_step, row_step)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BoardMetrics {
+    col_step: u16,
+    row_step: u16,
+    stone_rx: u16,
+    stone_ry: u16,
+    origin_x: u16,
+    origin_y: u16,
+    grid_x0: u16,
+    grid_y0: u16,
+    grid_w: u16,
+    grid_h: u16,
+    show_top_coords: bool,
+    show_bottom_coords: bool,
+    show_right_coords: bool,
+}
+
+fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
+    if area.width == 0 || area.height == 0 || size == 0 {
+        return None;
+    }
+    let (col_step, row_step) = compute_board_steps(area, size);
+    let (stone_rx, stone_ry) = stone_radii(col_step, row_step);
+    let gaps = u16::from(size.saturating_sub(1));
+    let grid_w = gaps * col_step;
+    let grid_h = gaps * row_step;
+
+    let min_w = LABEL_WIDTH + stone_rx + grid_w + stone_rx + 1;
+    let min_h = grid_h + 1;
+    if area.width < min_w || area.height < min_h {
+        return None;
+    }
+
+    let show_top_coords = area.height >= grid_h + 2;
+    let top_pad = if area.height >= grid_h + 2 + stone_ry * 2 {
+        1 + stone_ry
+    } else if show_top_coords {
+        1
+    } else {
+        0
+    };
+    let show_bottom_coords = area.height >= top_pad + grid_h + 1 + stone_ry + 1;
+    let show_right_coords = area.width >= min_w + LABEL_WIDTH;
+
+    let total_w = if show_right_coords {
+        min_w + LABEL_WIDTH
+    } else {
+        min_w
+    };
+    let total_h = top_pad
+        + grid_h
+        + 1
+        + if show_bottom_coords {
+            stone_ry + 1
+        } else {
+            0
+        };
+
+    let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
+    let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
+    let grid_x0 = origin_x + LABEL_WIDTH + stone_rx;
+    let grid_y0 = origin_y + top_pad;
+
+    Some(BoardMetrics {
+        col_step,
+        row_step,
+        stone_rx,
+        stone_ry,
+        origin_x,
+        origin_y,
+        grid_x0,
+        grid_y0,
+        grid_w,
+        grid_h,
+        show_top_coords,
+        show_bottom_coords,
+        show_right_coords,
+    })
 }
 
 /// Resolves a mouse click (click_x, click_y) inside `area` to a Go board coordinate.
 pub fn board_coord_at(area: Rect, size: u8, click_x: u16, click_y: u16) -> Option<Coord> {
-    if area.width == 0 || area.height == 0 || size == 0 {
+    let m = compute_metrics(area, size)?;
+
+    if click_x + m.col_step / 2 < m.grid_x0 || click_x > m.grid_x0 + m.grid_w + m.col_step / 2 {
         return None;
     }
-    let s = compute_board_scale(area, size);
-    let col_step = 2 * s;
-    let row_step = s;
-    let needed_width = LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
-    let needed_height = u16::from(size.saturating_sub(1)) * row_step + 1;
-    let show_bottom_coords = area.height >= needed_height + 2;
-    let show_right_coords = area.width >= needed_width + LABEL_WIDTH;
-    let total_w = if show_right_coords {
-        needed_width + LABEL_WIDTH
-    } else {
-        needed_width
-    };
-    let total_h = if show_bottom_coords {
-        needed_height + 2
-    } else {
-        needed_height + 1
-    };
-    let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
-    let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
-
-    let grid_x0 = origin_x + LABEL_WIDTH;
-    let grid_y0 = origin_y + 1;
-    let grid_w = u16::from(size.saturating_sub(1)) * col_step;
-    let grid_h = u16::from(size.saturating_sub(1)) * row_step;
-
-    if click_x + col_step / 2 < grid_x0 || click_x > grid_x0 + grid_w + col_step / 2 {
-        return None;
-    }
-    if click_y + row_step / 2 < grid_y0 || click_y > grid_y0 + grid_h + row_step / 2 {
+    if click_y + m.row_step / 2 < m.grid_y0 || click_y > m.grid_y0 + m.grid_h + m.row_step / 2 {
         return None;
     }
 
-    let rel_x = click_x.saturating_sub(grid_x0);
-    let col = (rel_x + col_step / 2) / col_step;
-    let rel_y = click_y.saturating_sub(grid_y0);
-    let row_idx = (rel_y + row_step / 2) / row_step;
+    let rel_x = click_x.saturating_sub(m.grid_x0);
+    let col = (rel_x + m.col_step / 2) / m.col_step;
+    let rel_y = click_y.saturating_sub(m.grid_y0);
+    let row_idx = (rel_y + m.row_step / 2) / m.row_step;
 
     if col < u16::from(size) && row_idx < u16::from(size) {
         let actual_row = u16::from(size) - row_idx;
@@ -222,9 +329,6 @@ pub fn board_coord_at(area: Rect, size: u8, click_x: u16, click_y: u16) -> Optio
 }
 
 /// Draws the board into an already-cleared inner area.
-///
-/// `area` is the area inside the pane border. The caller must have checked the
-/// minimum size; this function is still defensive about short areas.
 pub fn draw_board(
     buffer: &mut Buffer,
     area: Rect,
@@ -233,37 +337,17 @@ pub fn draw_board(
     focused: bool,
 ) {
     let size = game.size;
-    let s = compute_board_scale(area, size);
-    let col_step = 2 * s;
-    let row_step = s;
-
-    let needed_width = LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
-    let needed_height = u16::from(size.saturating_sub(1)) * row_step + 1;
-    if area.width < needed_width || area.height < needed_height {
-        let text = "board area too small";
-        buffer.set_string(
-            area.x,
-            area.y,
-            text,
-            Style::default().fg(theme.error),
-        );
+    let Some(m) = compute_metrics(area, size) else {
+        if area.width > 0 && area.height > 0 {
+            buffer.set_string(
+                area.x,
+                area.y,
+                "board area too small",
+                Style::default().fg(theme.error),
+            );
+        }
         return;
-    }
-
-    let show_bottom_coords = area.height >= needed_height + 2;
-    let show_right_coords = area.width >= needed_width + LABEL_WIDTH;
-    let total_w = if show_right_coords {
-        needed_width + LABEL_WIDTH
-    } else {
-        needed_width
     };
-    let total_h = if show_bottom_coords {
-        needed_height + 2
-    } else {
-        needed_height + 1
-    };
-    let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
-    let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
 
     let muted = theme.dim(theme.board);
     let header_style = Style::default().fg(if focused {
@@ -271,42 +355,102 @@ pub fn draw_board(
     } else {
         theme.board
     });
+    let grid_line_style = Style::default().fg(muted);
+
+    // Pass 1: Coordinate labels & full board grid
     for col in 0..size {
         if let Some(letter) = Board::letter_for_col(col) {
-            let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
+            let x = m.grid_x0 + u16::from(col) * m.col_step;
             let s_let = letter.to_string();
-            buffer.set_string(x, origin_y, &s_let, header_style);
-            if show_bottom_coords {
-                let bottom_y = origin_y + 1 + u16::from(size.saturating_sub(1)) * row_step + 1;
-                buffer.set_string(x, bottom_y, &s_let, header_style);
+            if m.show_top_coords {
+                buffer.set_string(x, m.origin_y, &s_let, header_style);
+            }
+            if m.show_bottom_coords {
+                let bottom_y = m.grid_y0 + m.grid_h + m.stone_ry + 1;
+                if bottom_y < area.y + area.height {
+                    buffer.set_string(x, bottom_y, &s_let, header_style);
+                }
             }
         }
     }
 
+    for row_index in 0..size {
+        let row = u16::from(size) - u16::from(row_index);
+        let y = m.grid_y0 + u16::from(row_index) * m.row_step;
+        let label = format!("{row:>width$} ", width = LABEL_WIDTH as usize - 1);
+        buffer.set_string(m.origin_x, y, &label, Style::default().fg(muted));
+        if m.show_right_coords {
+            let right_label = format!(" {row:<width$}", width = LABEL_WIDTH as usize - 1);
+            let right_x = m.grid_x0 + m.grid_w + m.stone_rx + 1;
+            if right_x + LABEL_WIDTH <= area.x + area.width {
+                buffer.set_string(right_x, y, &right_label, Style::default().fg(muted));
+            }
+        }
+
+        for col in 0..size {
+            let x = m.grid_x0 + u16::from(col) * m.col_step;
+            let glyph = intersection(size, col, row_index);
+            let fg = if is_hoshi_index(size, col, row_index) {
+                theme.board
+            } else {
+                muted
+            };
+            buffer.set_string(x, y, glyph.to_string(), Style::default().fg(fg));
+
+            if col + 1 < size {
+                for i in 1..m.col_step {
+                    buffer.set_string(x + i, y, "─", grid_line_style);
+                }
+            }
+            if row_index + 1 < size && m.row_step > 1 {
+                for k in 1..m.row_step {
+                    buffer.set_string(x, y + k, "│", grid_line_style);
+                }
+            }
+        }
+    }
+
+    // Pass 2: Stones, Ko markers, and Estimate overlays drawn on top of the grid
     let overlay = game
         .estimate_active
         .then(|| game.estimate_overlay())
         .unwrap_or_default();
     let last_move = game.last_move();
-    let grid_line_style = Style::default().fg(muted);
+    let min_draw_y = if m.show_top_coords {
+        m.origin_y + 1
+    } else {
+        area.y
+    };
+    let max_draw_y = if m.show_bottom_coords {
+        (m.grid_y0 + m.grid_h + m.stone_ry + 1).min(area.y + area.height)
+    } else {
+        area.y + area.height
+    };
+
+    let has_visual_stone = |c: u8, r_idx: u8| -> bool {
+        if r_idx >= size || c >= size {
+            return false;
+        }
+        let r = u16::from(size) - u16::from(r_idx);
+        if game.estimate_active {
+            let est = overlay
+                .get(r_idx as usize)
+                .and_then(|line| line.get(c as usize))
+                .copied();
+            matches!(
+                est,
+                Some(PointEstimate::LiveStone(_)) | Some(PointEstimate::DeadStone(_))
+            )
+        } else {
+            game.board().get(c, r).is_some()
+        }
+    };
 
     for row_index in 0..size {
         let row = u16::from(size) - u16::from(row_index);
-        let y = origin_y + 1 + u16::from(row_index) * row_step;
-        let label = format!("{row:>width$} ", width = LABEL_WIDTH as usize - 1);
-        buffer.set_string(origin_x, y, &label, Style::default().fg(muted));
-        if show_right_coords {
-            let right_label = format!(" {row:<width$}", width = LABEL_WIDTH as usize - 1);
-            let right_x = origin_x + LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
-            buffer.set_string(
-                right_x,
-                y,
-                &right_label,
-                Style::default().fg(muted),
-            );
-        }
+        let y = m.grid_y0 + u16::from(row_index) * m.row_step;
         for col in 0..size {
-            let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
+            let x = m.grid_x0 + u16::from(col) * m.col_step;
             let estimate = if game.estimate_active {
                 overlay
                     .get(row_index as usize)
@@ -315,102 +459,184 @@ pub fn draw_board(
             } else {
                 None
             };
-            let (cell, mut style) = cell_style(game, theme, col, row, estimate);
-            if last_move
+            let is_last = last_move
                 .map(|coord| coord.col == col && coord.row == row)
-                .unwrap_or(false)
-            {
-                style = style.fg(theme.last_move).add_modifier(Modifier::REVERSED);
-            }
-            buffer.set_string(x, y, &cell, style);
+                .unwrap_or(false);
 
-            if col + 1 < size {
-                for i in 1..col_step {
-                    buffer.set_string(x + i, y, "─", grid_line_style);
-                }
+            enum PointVisual {
+                Stone(Color),
+                DeadStone,
+                BlackTerr,
+                WhiteTerr,
+                Dame,
+                Ko,
+                Empty,
             }
-        }
 
-        if row_index + 1 < size && row_step > 1 {
-            for k in 1..row_step {
-                let mid_y = y + k;
-                for col in 0..size {
-                    let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
-                    buffer.set_string(x, mid_y, "│", grid_line_style);
-                }
-            }
-        }
-    }
-}
+            let visual = match estimate {
+                Some(PointEstimate::DeadStone(_)) => PointVisual::DeadStone,
+                Some(PointEstimate::BlackTerritory) => PointVisual::BlackTerr,
+                Some(PointEstimate::WhiteTerritory) => PointVisual::WhiteTerr,
+                Some(PointEstimate::Dame) => PointVisual::Dame,
+                Some(PointEstimate::LiveStone(c)) => PointVisual::Stone(c),
+                None => match game.board().get(col, row) {
+                    Some(c) => PointVisual::Stone(c),
+                    None if game.ko_point() == Some((col, row)) => PointVisual::Ko,
+                    None => PointVisual::Empty,
+                },
+            };
 
-fn cell_style(
-    game: &GameView,
-    theme: &Theme,
-    col: u8,
-    row: u16,
-    estimate: Option<PointEstimate>,
-) -> (String, Style) {
-    let size = game.size;
-    let row_index = u16::from(size) - row;
-    match estimate {
-        Some(PointEstimate::DeadStone(_color)) => (
-            "╳".to_string(),
-            Style::default()
-                .fg(theme.dead_stone)
-                .add_modifier(Modifier::DIM),
-        ),
-        Some(PointEstimate::BlackTerritory) => (
-            "■".to_string(),
-            Style::default().fg(theme.territory_black),
-        ),
-        Some(PointEstimate::WhiteTerritory) => (
-            "□".to_string(),
-            Style::default().fg(theme.territory_white),
-        ),
-        Some(PointEstimate::Dame) => (
-            "·".to_string(),
-            Style::default().fg(theme.muted),
-        ),
-        Some(PointEstimate::LiveStone(color)) => stone_cell(color, theme),
-        None => match game.board().get(col, row) {
-            Some(color) => stone_cell(color, theme),
-            None => {
-                if game.ko_point() == Some((col, row)) {
-                    (
-                        "◆".to_string(),
-                        Style::default()
-                            .fg(theme.warning)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    let r_idx = u8::try_from(row_index).unwrap_or(0);
-                    let glyph = intersection(size, col, r_idx);
-                    let fg = if is_hoshi_index(size, col, r_idx) {
-                        theme.board
+            match visual {
+                PointVisual::Empty => {}
+                PointVisual::Ko => {
+                    let style = Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD);
+                    if m.stone_rx >= 1 {
+                        buffer.set_string(x - 1, y, "[◆]", style);
                     } else {
-                        theme.dim(theme.board)
+                        buffer.set_string(x, y, "◆", style);
+                    }
+                }
+                PointVisual::BlackTerr => {
+                    let style = Style::default()
+                        .fg(theme.territory_black)
+                        .add_modifier(Modifier::BOLD);
+                    if m.stone_rx >= 1 {
+                        buffer.set_string(x - 1, y, " ■ ", style);
+                    } else {
+                        buffer.set_string(x, y, "■", style);
+                    }
+                }
+                PointVisual::WhiteTerr => {
+                    let style = Style::default()
+                        .fg(theme.territory_white)
+                        .add_modifier(Modifier::BOLD);
+                    if m.stone_rx >= 1 {
+                        buffer.set_string(x - 1, y, " □ ", style);
+                    } else {
+                        buffer.set_string(x, y, "□", style);
+                    }
+                }
+                PointVisual::Dame => {
+                    buffer.set_string(x, y, "·", Style::default().fg(theme.muted));
+                }
+                PointVisual::DeadStone => {
+                    let style = Style::default()
+                        .fg(theme.dead_stone)
+                        .add_modifier(Modifier::DIM);
+                    if m.stone_rx == 2 && m.stone_ry == 1 {
+                        if y > min_draw_y {
+                            buffer.set_string(x - 2, y - 1, "╭───╮", style);
+                        }
+                        buffer.set_string(x - 2, y, "│ ╳ │", style);
+                        if y + 1 < max_draw_y {
+                            buffer.set_string(x - 2, y + 1, "╰───╯", style);
+                        }
+                    } else if m.stone_rx == 1 && m.stone_ry == 1 {
+                        if y > min_draw_y {
+                            buffer.set_string(x - 1, y - 1, "╭─╮", style);
+                        }
+                        buffer.set_string(x - 1, y, "│╳│", style);
+                        if y + 1 < max_draw_y {
+                            buffer.set_string(x - 1, y + 1, "╰─╯", style);
+                        }
+                    } else if m.stone_rx >= 1 {
+                        buffer.set_string(x - 1, y, "(╳)", style);
+                    } else {
+                        buffer.set_string(x, y, "╳", style);
+                    }
+                }
+                PointVisual::Stone(color) => {
+                    let base_fg = match color {
+                        Color::Black => theme.stone_black,
+                        Color::White => theme.stone_white,
                     };
-                    (glyph.to_string(), Style::default().fg(fg))
+                    let border_style = Style::default()
+                        .fg(if is_last { theme.last_move } else { base_fg })
+                        .add_modifier(Modifier::BOLD);
+                    let body_style = Style::default()
+                        .fg(base_fg)
+                        .add_modifier(Modifier::BOLD);
+                    let last_center_style = Style::default()
+                        .fg(theme.last_move)
+                        .add_modifier(Modifier::BOLD);
+
+                    let neighbor_up = row_index > 0
+                        && m.row_step == 2
+                        && has_visual_stone(col, row_index - 1);
+                    let neighbor_down = row_index + 1 < size
+                        && m.row_step == 2
+                        && has_visual_stone(col, row_index + 1);
+
+                    if m.stone_rx == 2 && m.stone_ry == 1 {
+                        // 5x3 Large Stone
+                        if y >= min_draw_y + 1 {
+                            let top_str = if neighbor_up { "├───┤" } else { "╭───╮" };
+                            buffer.set_string(x - 2, y - 1, top_str, border_style);
+                        }
+                        let mid_str = match color {
+                            Color::Black => "│███│",
+                            Color::White => "│ ○ │",
+                        };
+                        buffer.set_string(x - 2, y, mid_str, body_style);
+                        if is_last {
+                            buffer.set_string(x - 2, y, "│", border_style);
+                            buffer.set_string(x + 2, y, "│", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
+                        }
+                        if y + 1 < max_draw_y {
+                            let bot_str = if neighbor_down { "├───┤" } else { "╰───╯" };
+                            buffer.set_string(x - 2, y + 1, bot_str, border_style);
+                        }
+                    } else if m.stone_rx == 1 && m.stone_ry == 1 {
+                        // 3x3 Medium Stone
+                        if y >= min_draw_y + 1 {
+                            let top_str = if neighbor_up { "├─┤" } else { "╭─╮" };
+                            buffer.set_string(x - 1, y - 1, top_str, border_style);
+                        }
+                        let mid_str = match color {
+                            Color::Black => "│█│",
+                            Color::White => "│○│",
+                        };
+                        buffer.set_string(x - 1, y, mid_str, body_style);
+                        if is_last {
+                            buffer.set_string(x - 1, y, "│", border_style);
+                            buffer.set_string(x + 1, y, "│", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
+                        }
+                        if y + 1 < max_draw_y {
+                            let bot_str = if neighbor_down { "├─┤" } else { "╰─╯" };
+                            buffer.set_string(x - 1, y + 1, bot_str, border_style);
+                        }
+                    } else if m.stone_rx >= 1 {
+                        // 3x1 Wide Stone (e.g. 19x19 in standard-height terminals)
+                        let glyph = match color {
+                            Color::Black => "(█)",
+                            Color::White => "(○)",
+                        };
+                        buffer.set_string(x - 1, y, glyph, body_style);
+                        if is_last {
+                            buffer.set_string(x - 1, y, "(", border_style);
+                            buffer.set_string(x + 1, y, ")", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
+                        }
+                    } else {
+                        // 1x1 Compact Stone
+                        let glyph = match color {
+                            Color::Black => "●",
+                            Color::White => "○",
+                        };
+                        let st = if is_last {
+                            body_style.fg(theme.last_move).add_modifier(Modifier::REVERSED)
+                        } else {
+                            body_style
+                        };
+                        buffer.set_string(x, y, glyph, st);
+                    }
                 }
             }
-        },
-    }
-}
-
-fn stone_cell(color: Color, theme: &Theme) -> (String, Style) {
-    match color {
-        Color::Black => (
-            "●".to_string(),
-            Style::default()
-                .fg(theme.stone_black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Color::White => (
-            "○".to_string(),
-            Style::default()
-                .fg(theme.stone_white)
-                .add_modifier(Modifier::BOLD),
-        ),
+        }
     }
 }
 
