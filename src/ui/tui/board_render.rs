@@ -154,7 +154,9 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
 
 /// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
 pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
-    let rx = if col_step >= 5 {
+    let rx = if col_step >= 7 && row_step >= 2 {
+        3
+    } else if col_step >= 5 {
         2
     } else if col_step >= 3 {
         1
@@ -180,7 +182,7 @@ pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     // Find maximum horizontal step that fits `area.width`
     let mut max_col = 2u16;
     for c in 2..=12 {
-        let rx = if c >= 5 { 2 } else if c >= 3 { 1 } else { 0 };
+        let rx = if c >= 7 { 3 } else if c >= 5 { 2 } else if c >= 3 { 1 } else { 0 };
         let needed_w = LABEL_WIDTH + rx + gaps * c + rx + 1;
         if needed_w <= area.width {
             max_col = c;
@@ -211,8 +213,8 @@ pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     let row_step = max_row.max(1);
     let col_step = if row_step == 1 {
         // When vertical height limits row_step to 1 (e.g. 19x19 on shorter terminals),
-        // still expand horizontally up to 5 cols per step so 19x19 fills the pane and uses 3..5-col stones.
-        max_col.clamp(2, 5)
+        // still expand horizontally up to 6 cols per step so 19x19 fills the pane and uses 3..5-col stones.
+        max_col.clamp(2, 6)
     } else if row_step == 2 {
         // For row_step == 2 (19x19 or 13x13), expand up to 6 cols per step so 5x3 stones can be used on wide screens
         max_col.clamp(3, 6)
@@ -525,7 +527,15 @@ pub fn draw_board(
                     let style = Style::default()
                         .fg(theme.dead_stone)
                         .add_modifier(Modifier::DIM);
-                    if m.stone_rx == 2 && m.stone_ry == 1 {
+                    if m.stone_rx == 3 && m.stone_ry == 1 {
+                        if y > min_draw_y {
+                            buffer.set_string(x - 3, y - 1, "╭─────╮", style);
+                        }
+                        buffer.set_string(x - 3, y, "│  ╳  │", style);
+                        if y + 1 < max_draw_y {
+                            buffer.set_string(x - 3, y + 1, "╰─────╯", style);
+                        }
+                    } else if m.stone_rx == 2 && m.stone_ry == 1 {
                         if y > min_draw_y {
                             buffer.set_string(x - 2, y - 1, "╭───╮", style);
                         }
@@ -541,6 +551,8 @@ pub fn draw_board(
                         if y + 1 < max_draw_y {
                             buffer.set_string(x - 1, y + 1, "╰─╯", style);
                         }
+                    } else if m.stone_rx >= 2 {
+                        buffer.set_string(x - 2, y, "( ╳ )", style);
                     } else if m.stone_rx >= 1 {
                         buffer.set_string(x - 1, y, "(╳)", style);
                     } else {
@@ -569,7 +581,27 @@ pub fn draw_board(
                         && m.row_step == 2
                         && has_visual_stone(col, row_index + 1);
 
-                    if m.stone_rx == 2 && m.stone_ry == 1 {
+                    if m.stone_rx == 3 && m.stone_ry == 1 {
+                        // 7x3 Extra-Large Stone
+                        if y >= min_draw_y + 1 {
+                            let top_str = if neighbor_up { "├─────┤" } else { "╭─────╮" };
+                            buffer.set_string(x - 3, y - 1, top_str, border_style);
+                        }
+                        let mid_str = match color {
+                            Color::Black => "│█████│",
+                            Color::White => "│  ○  │",
+                        };
+                        buffer.set_string(x - 3, y, mid_str, body_style);
+                        if is_last {
+                            buffer.set_string(x - 3, y, "│", border_style);
+                            buffer.set_string(x + 3, y, "│", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
+                        }
+                        if y + 1 < max_draw_y {
+                            let bot_str = if neighbor_down { "├─────┤" } else { "╰─────╯" };
+                            buffer.set_string(x - 3, y + 1, bot_str, border_style);
+                        }
+                    } else if m.stone_rx == 2 && m.stone_ry == 1 {
                         // 5x3 Large Stone
                         if y >= min_draw_y + 1 {
                             let top_str = if neighbor_up { "├───┤" } else { "╭───╮" };
@@ -608,6 +640,18 @@ pub fn draw_board(
                         if y + 1 < max_draw_y {
                             let bot_str = if neighbor_down { "├─┤" } else { "╰─╯" };
                             buffer.set_string(x - 1, y + 1, bot_str, border_style);
+                        }
+                    } else if m.stone_rx >= 2 {
+                        // 5x1 Wide Stone (e.g. 19x19 in wide, standard-height terminals)
+                        let glyph = match color {
+                            Color::Black => "(███)",
+                            Color::White => "( ○ )",
+                        };
+                        buffer.set_string(x - 2, y, glyph, body_style);
+                        if is_last {
+                            buffer.set_string(x - 2, y, "(", border_style);
+                            buffer.set_string(x + 2, y, ")", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
                         }
                     } else if m.stone_rx >= 1 {
                         // 3x1 Wide Stone (e.g. 19x19 in standard-height terminals)

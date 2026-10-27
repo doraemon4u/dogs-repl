@@ -1258,14 +1258,27 @@ const HTML_PAGE = `<!DOCTYPE html>
 
     function buildLineGridBoardSvg(size, grid, lastMove, koPoint, est, toPlay) {
       const V = 1000;
-      const pad = size === 19 ? 68 : size === 13 ? 76 : 86;
+      const pad = size === 19 ? 46 : size === 13 ? 56 : 66;
       const span = V - pad * 2;
       const step = size > 1 ? span / (size - 1) : span;
-      const stoneR = Math.min(36, step * 0.44);
-      const crossArm = Math.max(6, Math.min(13, step * 0.16));
-      const fontSize = size === 19 ? 21 : size === 13 ? 24 : 27;
+      // Scale stone radius proportionally with grid step (no fixed pixel cap) so stones always match board scale
+      const stoneR = step * 0.475;
+      const crossArm = Math.max(7, step * 0.18);
+      const fontSize = size === 19 ? 20 : size === 13 ? 24 : 28;
 
       let svg = \`<svg class="board-svg" viewBox="0 0 \${V} \${V}" xmlns="http://www.w3.org/2000/svg">\`;
+      svg += \`<defs>
+        <radialGradient id="blackStoneGrad" cx="35%" cy="32%" r="65%">
+          <stop offset="0%" stop-color="#388bfd" />
+          <stop offset="55%" stop-color="#1f6feb" />
+          <stop offset="100%" stop-color="#0d2d6c" />
+        </radialGradient>
+        <radialGradient id="whiteStoneGrad" cx="35%" cy="32%" r="65%">
+          <stop offset="0%" stop-color="#ffffff" />
+          <stop offset="70%" stop-color="#e6edf3" />
+          <stop offset="100%" stop-color="#b1bac4" />
+        </radialGradient>
+      </defs>\`;
       // Subtle board surface
       svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="8" fill="#0f141c" />\`;
 
@@ -1273,14 +1286,14 @@ const HTML_PAGE = `<!DOCTYPE html>
       for (let c = 0; c < size; c++) {
         const x = (pad + c * step).toFixed(2);
         const lbl = COLS[c];
-        svg += \`<text x="\${x}" y="\${(pad * 0.44).toFixed(2)}" fill="#7d8590" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
-        svg += \`<text x="\${x}" y="\${(V - pad * 0.44).toFixed(2)}" fill="#7d8590" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
+        svg += \`<text x="\${x}" y="\${(pad * 0.42).toFixed(2)}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
+        svg += \`<text x="\${x}" y="\${(V - pad * 0.42).toFixed(2)}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
       }
       for (let r = 1; r <= size; r++) {
         const rIdx = size - r;
         const y = (pad + rIdx * step).toFixed(2);
-        svg += \`<text x="\${(pad * 0.42).toFixed(2)}" y="\${y}" fill="#7d8590" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
-        svg += \`<text x="\${(V - pad * 0.42).toFixed(2)}" y="\${y}" fill="#7d8590" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${(pad * 0.40).toFixed(2)}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${(V - pad * 0.40).toFixed(2)}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
       }
 
       // Square Grid Lines (Horizontal & Vertical lines)
@@ -1289,8 +1302,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       for (let i = 0; i < size; i++) {
         const pos = (pad + i * step).toFixed(2);
         const isBorder = i === 0 || i === size - 1;
-        const strokeColor = isBorder ? '#6e7681' : '#3b434d';
-        const strokeW = isBorder ? '2.6' : '1.6';
+        const strokeColor = isBorder ? '#8b949e' : '#3b434d';
+        const strokeW = isBorder ? '2.8' : (size === 19 ? '1.7' : '2.0');
         // Horizontal line
         svg += \`<line x1="\${start}" y1="\${pos}" x2="\${end}" y2="\${pos}" stroke="\${strokeColor}" stroke-width="\${strokeW}" />\`;
         // Vertical line
@@ -1304,7 +1317,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         for (let c = 0; c < size; c++) {
           if (!isHoshi(size, c, r)) continue;
           const x = pad + c * step;
-          svg += \`<g class="hoshi-cross" stroke="#d29922" stroke-width="3.2" stroke-linecap="square">\`;
+          svg += \`<g class="hoshi-cross" stroke="#d29922" stroke-width="3.4" stroke-linecap="square">\`;
           svg += \`<line x1="\${(x - crossArm).toFixed(2)}" y1="\${y.toFixed(2)}" x2="\${(x + crossArm).toFixed(2)}" y2="\${y.toFixed(2)}" />\`;
           svg += \`<line x1="\${x.toFixed(2)}" y1="\${(y - crossArm).toFixed(2)}" x2="\${x.toFixed(2)}" y2="\${(y + crossArm).toFixed(2)}" />\`;
           svg += \`</g>\`;
@@ -1330,33 +1343,33 @@ const HTML_PAGE = `<!DOCTYPE html>
           svg += \`<g class="board-hit" onclick="handleBoardClick(\${c}, \${r})"><title>\${tip}</title>\`;
 
           if (stone === 'B') {
-            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR.toFixed(2)}" fill="#1f6feb" stroke="#58a6ff" stroke-width="2.4" opacity="\${isDead ? '0.42' : '1'}" />\`;
+            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR.toFixed(2)}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="\${(Math.max(2, stoneR * 0.08)).toFixed(2)}" opacity="\${isDead ? '0.42' : '1'}" />\`;
           } else if (stone === 'W') {
-            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR.toFixed(2)}" fill="#e6edf3" stroke="#8b949e" stroke-width="2.2" opacity="\${isDead ? '0.42' : '1'}" />\`;
+            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR.toFixed(2)}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="\${(Math.max(2, stoneR * 0.07)).toFixed(2)}" opacity="\${isDead ? '0.42' : '1'}" />\`;
           } else if (isKo) {
-            const koHalf = stoneR * 0.56;
+            const koHalf = stoneR * 0.58;
             svg += \`<rect x="\${(x - koHalf).toFixed(2)}" y="\${(y - koHalf).toFixed(2)}" width="\${(koHalf * 2).toFixed(2)}" height="\${(koHalf * 2).toFixed(2)}" fill="rgba(248, 81, 73, 0.22)" stroke="#e3b341" stroke-width="2.8" />\`;
           } else if (est && est.territory[r - 1][c] === 'B') {
-            const tHalf = stoneR * 0.34;
+            const tHalf = stoneR * 0.36;
             svg += \`<rect x="\${(x - tHalf).toFixed(2)}" y="\${(y - tHalf).toFixed(2)}" width="\${(tHalf * 2).toFixed(2)}" height="\${(tHalf * 2).toFixed(2)}" fill="#388bfd" />\`;
           } else if (est && est.territory[r - 1][c] === 'W') {
-            const tHalf = stoneR * 0.34;
+            const tHalf = stoneR * 0.36;
             svg += \`<rect x="\${(x - tHalf).toFixed(2)}" y="\${(y - tHalf).toFixed(2)}" width="\${(tHalf * 2).toFixed(2)}" height="\${(tHalf * 2).toFixed(2)}" fill="#d2a8ff" />\`;
           } else {
             // Hover preview ring on empty intersection
             const hoverStroke = toPlay === 'B' ? '#58a6ff' : '#f0f6fc';
-            svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${(stoneR * 0.72).toFixed(2)}" fill="none" stroke="\${hoverStroke}" stroke-width="2" stroke-dasharray="4 3" />\`;
+            svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${(stoneR * 0.78).toFixed(2)}" fill="none" stroke="\${hoverStroke}" stroke-width="2.2" stroke-dasharray="4 3" />\`;
           }
 
           if (isDead && stone) {
-            const dArm = stoneR * 0.55;
-            svg += \`<line x1="\${(x - dArm).toFixed(2)}" y1="\${(y - dArm).toFixed(2)}" x2="\${(x + dArm).toFixed(2)}" y2="\${(y + dArm).toFixed(2)}" stroke="#f85149" stroke-width="3.2" />\`;
-            svg += \`<line x1="\${(x + dArm).toFixed(2)}" y1="\${(y - dArm).toFixed(2)}" x2="\${(x - dArm).toFixed(2)}" y2="\${(y + dArm).toFixed(2)}" stroke="#f85149" stroke-width="3.2" />\`;
+            const dArm = stoneR * 0.56;
+            svg += \`<line x1="\${(x - dArm).toFixed(2)}" y1="\${(y - dArm).toFixed(2)}" x2="\${(x + dArm).toFixed(2)}" y2="\${(y + dArm).toFixed(2)}" stroke="#f85149" stroke-width="3.4" />\`;
+            svg += \`<line x1="\${(x + dArm).toFixed(2)}" y1="\${(y - dArm).toFixed(2)}" x2="\${(x - dArm).toFixed(2)}" y2="\${(y + dArm).toFixed(2)}" stroke="#f85149" stroke-width="3.4" />\`;
           }
 
           if (isLast && stone) {
             const ringColor = stone === 'B' ? '#f0f6fc' : '#1f6feb';
-            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${(stoneR * 0.42).toFixed(2)}" fill="none" stroke="\${ringColor}" stroke-width="2.8" />\`;
+            svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${(stoneR * 0.42).toFixed(2)}" fill="none" stroke="\${ringColor}" stroke-width="\${(Math.max(2.6, stoneR * 0.11)).toFixed(2)}" />\`;
           }
 
           // Invisible hit target covering the intersection square
