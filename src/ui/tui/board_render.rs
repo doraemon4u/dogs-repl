@@ -4,6 +4,7 @@
 //! looks the same whether it is drawn with `ratatui` or printed to stdout.
 
 use crate::engine::board::{Board, Color};
+use crate::engine::coord::Coord;
 use crate::engine::estimate::PointEstimate;
 use crate::session::store::GameView;
 use crate::ui::tui::theme::Theme;
@@ -151,6 +152,75 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
     }
 }
 
+/// Computes the optimal integer scaling factor S so 9x9 and 13x13 boards stretch
+/// to fill the available pane cleanly while keeping square cells (col_step = 2 * S, row_step = S).
+pub fn compute_board_scale(area: Rect, size: u8) -> u16 {
+    if size == 0 {
+        return 1;
+    }
+    let mut best_scale = 1;
+    for s in 1..=8 {
+        let needed_h = u16::from(size.saturating_sub(1)) * s + 3;
+        let needed_w = u16::from(size.saturating_sub(1)) * (2 * s) + LABEL_WIDTH * 2 + 1;
+        if needed_h <= area.height && needed_w <= area.width {
+            best_scale = s;
+        } else {
+            break;
+        }
+    }
+    best_scale
+}
+
+/// Resolves a mouse click (click_x, click_y) inside `area` to a Go board coordinate.
+pub fn board_coord_at(area: Rect, size: u8, click_x: u16, click_y: u16) -> Option<Coord> {
+    if area.width == 0 || area.height == 0 || size == 0 {
+        return None;
+    }
+    let s = compute_board_scale(area, size);
+    let col_step = 2 * s;
+    let row_step = s;
+    let needed_width = LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
+    let needed_height = u16::from(size.saturating_sub(1)) * row_step + 1;
+    let show_bottom_coords = area.height >= needed_height + 2;
+    let show_right_coords = area.width >= needed_width + LABEL_WIDTH;
+    let total_w = if show_right_coords {
+        needed_width + LABEL_WIDTH
+    } else {
+        needed_width
+    };
+    let total_h = if show_bottom_coords {
+        needed_height + 2
+    } else {
+        needed_height + 1
+    };
+    let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
+    let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
+
+    let grid_x0 = origin_x + LABEL_WIDTH;
+    let grid_y0 = origin_y + 1;
+    let grid_w = u16::from(size.saturating_sub(1)) * col_step;
+    let grid_h = u16::from(size.saturating_sub(1)) * row_step;
+
+    if click_x + col_step / 2 < grid_x0 || click_x > grid_x0 + grid_w + col_step / 2 {
+        return None;
+    }
+    if click_y + row_step / 2 < grid_y0 || click_y > grid_y0 + grid_h + row_step / 2 {
+        return None;
+    }
+
+    let rel_x = click_x.saturating_sub(grid_x0);
+    let col = (rel_x + col_step / 2) / col_step;
+    let rel_y = click_y.saturating_sub(grid_y0);
+    let row_idx = (rel_y + row_step / 2) / row_step;
+
+    if col < u16::from(size) && row_idx < u16::from(size) {
+        let actual_row = u16::from(size) - row_idx;
+        Some(Coord::new(col as u8, actual_row))
+    } else {
+        None
+    }
+}
+
 /// Draws the board into an already-cleared inner area.
 ///
 /// `area` is the area inside the pane border. The caller must have checked the
@@ -163,8 +233,12 @@ pub fn draw_board(
     focused: bool,
 ) {
     let size = game.size;
-    let needed_width = LABEL_WIDTH + u16::from(size) * 2;
-    let needed_height = u16::from(size) + 1;
+    let s = compute_board_scale(area, size);
+    let col_step = 2 * s;
+    let row_step = s;
+
+    let needed_width = LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
+    let needed_height = u16::from(size.saturating_sub(1)) * row_step + 1;
     if area.width < needed_width || area.height < needed_height {
         let text = "board area too small";
         buffer.set_string(
@@ -176,7 +250,7 @@ pub fn draw_board(
         return;
     }
 
-    let show_bottom_coords = area.height > needed_height;
+    let show_bottom_coords = area.height >= needed_height + 2;
     let show_right_coords = area.width >= needed_width + LABEL_WIDTH;
     let total_w = if show_right_coords {
         needed_width + LABEL_WIDTH
@@ -184,9 +258,9 @@ pub fn draw_board(
         needed_width
     };
     let total_h = if show_bottom_coords {
-        needed_height + 1
+        needed_height + 2
     } else {
-        needed_height
+        needed_height + 1
     };
     let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
     let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
@@ -199,11 +273,12 @@ pub fn draw_board(
     });
     for col in 0..size {
         if let Some(letter) = Board::letter_for_col(col) {
-            let x = origin_x + LABEL_WIDTH + u16::from(col) * 2;
-            let s = letter.to_string();
-            buffer.set_string(x, origin_y, &s, header_style);
+            let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
+            let s_let = letter.to_string();
+            buffer.set_string(x, origin_y, &s_let, header_style);
             if show_bottom_coords {
-                buffer.set_string(x, origin_y + 1 + u16::from(size), &s, header_style);
+                let bottom_y = origin_y + 1 + u16::from(size.saturating_sub(1)) * row_step + 1;
+                buffer.set_string(x, bottom_y, &s_let, header_style);
             }
         }
     }
@@ -217,20 +292,21 @@ pub fn draw_board(
 
     for row_index in 0..size {
         let row = u16::from(size) - u16::from(row_index);
-        let y = origin_y + 1 + u16::from(row_index);
+        let y = origin_y + 1 + u16::from(row_index) * row_step;
         let label = format!("{row:>width$} ", width = LABEL_WIDTH as usize - 1);
         buffer.set_string(origin_x, y, &label, Style::default().fg(muted));
         if show_right_coords {
             let right_label = format!(" {row:<width$}", width = LABEL_WIDTH as usize - 1);
+            let right_x = origin_x + LABEL_WIDTH + u16::from(size.saturating_sub(1)) * col_step + 1;
             buffer.set_string(
-                origin_x + LABEL_WIDTH + u16::from(size) * 2,
+                right_x,
                 y,
                 &right_label,
                 Style::default().fg(muted),
             );
         }
         for col in 0..size {
-            let x = origin_x + LABEL_WIDTH + u16::from(col) * 2;
+            let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
             let estimate = if game.estimate_active {
                 overlay
                     .get(row_index as usize)
@@ -247,8 +323,21 @@ pub fn draw_board(
                 style = style.fg(theme.last_move).add_modifier(Modifier::REVERSED);
             }
             buffer.set_string(x, y, &cell, style);
-            if cell.chars().count() == 1 && col + 1 < size {
-                buffer.set_string(x + 1, y, "─", grid_line_style);
+
+            if col + 1 < size {
+                for i in 1..col_step {
+                    buffer.set_string(x + i, y, "─", grid_line_style);
+                }
+            }
+        }
+
+        if row_index + 1 < size && row_step > 1 {
+            for k in 1..row_step {
+                let mid_y = y + k;
+                for col in 0..size {
+                    let x = origin_x + LABEL_WIDTH + u16::from(col) * col_step;
+                    buffer.set_string(x, mid_y, "│", grid_line_style);
+                }
             }
         }
     }
@@ -265,21 +354,21 @@ fn cell_style(
     let row_index = u16::from(size) - row;
     match estimate {
         Some(PointEstimate::DeadStone(_color)) => (
-            "╳ ".to_string(),
+            "╳".to_string(),
             Style::default()
                 .fg(theme.dead_stone)
                 .add_modifier(Modifier::DIM),
         ),
         Some(PointEstimate::BlackTerritory) => (
-            "■ ".to_string(),
+            "■".to_string(),
             Style::default().fg(theme.territory_black),
         ),
         Some(PointEstimate::WhiteTerritory) => (
-            "□ ".to_string(),
+            "□".to_string(),
             Style::default().fg(theme.territory_white),
         ),
         Some(PointEstimate::Dame) => (
-            "· ".to_string(),
+            "·".to_string(),
             Style::default().fg(theme.muted),
         ),
         Some(PointEstimate::LiveStone(color)) => stone_cell(color, theme),
@@ -288,7 +377,7 @@ fn cell_style(
             None => {
                 if game.ko_point() == Some((col, row)) {
                     (
-                        "□ ".to_string(),
+                        "◆".to_string(),
                         Style::default()
                             .fg(theme.warning)
                             .add_modifier(Modifier::BOLD),
@@ -296,17 +385,12 @@ fn cell_style(
                 } else {
                     let r_idx = u8::try_from(row_index).unwrap_or(0);
                     let glyph = intersection(size, col, r_idx);
-                    let cell = if col + 1 < size {
-                        format!("{glyph}─")
-                    } else {
-                        format!("{glyph} ")
-                    };
                     let fg = if is_hoshi_index(size, col, r_idx) {
                         theme.board
                     } else {
                         theme.dim(theme.board)
                     };
-                    (cell, Style::default().fg(fg))
+                    (glyph.to_string(), Style::default().fg(fg))
                 }
             }
         },

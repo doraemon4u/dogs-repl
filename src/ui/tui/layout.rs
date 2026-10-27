@@ -57,6 +57,7 @@ pub fn board_pane_height(board_size: u8) -> u16 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GameLayout {
+    pub header: Rect,
     pub board: Rect,
     pub moves: Rect,
     pub chat: Rect,
@@ -66,6 +67,7 @@ pub struct GameLayout {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LobbyLayout {
+    pub header: Rect,
     pub panel: Rect,
     pub games: Rect,
     pub chat: Rect,
@@ -89,13 +91,17 @@ pub fn too_small(area: Rect, scene: Scene) -> Option<(u16, u16)> {
     (area.width < min_width || area.height < min_height).then_some((min_width, min_height))
 }
 
-/// Splits the game screen into board, moves, chat, status, and input.
+/// Splits the game screen into header, board, moves, chat, status, and input.
 pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(INPUT_ROWS)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(INPUT_ROWS),
+        ])
         .split(area);
-    let (main, bottom) = (vertical[0], vertical[1]);
+    let (header, main, bottom) = (vertical[0], vertical[1], vertical[2]);
     let bottom_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -112,6 +118,7 @@ pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(horizontal[1]);
     GameLayout {
+        header,
         board: horizontal[0],
         moves: right[0],
         chat: right[1],
@@ -120,15 +127,17 @@ pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
     }
 }
 
-/// Splits the lobby screen. The lobby deliberately shares one outer pane
-/// (design §9.5): browsing is a single activity, so the left info and right
-/// chat are separated by a divider rather than independent frames.
+/// Splits the lobby screen.
 pub fn split_lobby(area: Rect) -> LobbyLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(INPUT_ROWS)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(INPUT_ROWS),
+        ])
         .split(area);
-    let (main, bottom) = (vertical[0], vertical[1]);
+    let (header, main, bottom) = (vertical[0], vertical[1], vertical[2]);
     let bottom_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -138,6 +147,7 @@ pub fn split_lobby(area: Rect) -> LobbyLayout {
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(main);
     LobbyLayout {
+        header,
         panel: main,
         games: horizontal[0],
         chat: horizontal[1],

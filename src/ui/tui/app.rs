@@ -7,23 +7,28 @@
 use crate::config;
 use crate::engine::board::Color as StoneColor;
 use crate::engine::estimate::{score, ScoringRules};
+use crate::engine::coord::Coord;
 use crate::session::store::{ChatScope, ConnectionState, GameView, LogLevel, Store};
 use crate::session::{Command, SessionHandle};
 use crate::ui::challenge_options;
 use crate::ui::commands::{self, EstimateCommand, ScoreCommand, UndoCommand, UserCommand};
+use crate::ui::tui::board_render;
 use crate::ui::tui::input::InputState;
 use crate::ui::tui::layout::{self, Scene};
 use crate::ui::tui::theme::{ColorSupport, Theme};
 use crate::ui::tui::widgets::{self, Overlay};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, execute};
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
 use ratatui::{Frame, Terminal};
+use std::cell::Cell;
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -111,6 +116,12 @@ struct App {
     pending_game: Option<u64>,
     last_draw: Instant,
     persist_path: String,
+    last_header_area: Cell<Rect>,
+    last_board_area: Cell<Rect>,
+    last_board_inner: Cell<Rect>,
+    last_moves_area: Cell<Rect>,
+    last_chat_area: Cell<Rect>,
+    last_chat_inner: Cell<Rect>,
 }
 
 impl App {
@@ -139,6 +150,12 @@ impl App {
             pending_game: startup.initial_game,
             last_draw: Instant::now() - Duration::from_secs(1),
             persist_path: config::credentials_path().display().to_string(),
+            last_header_area: Cell::new(Rect::default()),
+            last_board_area: Cell::new(Rect::default()),
+            last_board_inner: Cell::new(Rect::default()),
+            last_moves_area: Cell::new(Rect::default()),
+            last_chat_area: Cell::new(Rect::default()),
+            last_chat_inner: Cell::new(Rect::default()),
         }
     }
 
@@ -230,7 +247,61 @@ impl App {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 self.handle_key(key);
             }
+            Event::Mouse(mouse) => {
+                self.handle_mouse(mouse);
+            }
             _ => {}
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        self.dirty = true;
+        let (mx, my) = (mouse.column, mouse.row);
+
+        let cur_size = self.focused_game().map(|g| g.size).unwrap_or(9);
+        let est_active = self.focused_game().map(|g| g.estimate_active).unwrap_or(false);
+
+        // 1. Header action buttons click
+        let header_area = self.last_header_area.get();
+        if let Some(cmd_str) = widgets::header_action_at(mx, my, header_area, cur_size, est_active) {
+            let cmd = commands::parse(cmd_str);
+            self.dispatch(cmd);
+            return;
+        }
+
+        // 2. Board intersection click
+        if let Some(game) = self.focused_game() {
+            let board_inner = self.last_board_inner.get();
+            if let Some(coord) = board_render::board_coord_at(board_inner, game.size, mx, my) {
+                self.focus = FocusPane::Board;
+                self.dispatch(UserCommand::Coordinate(coord));
+                return;
+            }
+        }
+
+        // 3. Chat channel pill click
+        let chat_inner = self.last_chat_inner.get();
+        if let Some(action) = widgets::chat_channel_at(mx, my, chat_inner) {
+            if action == "channels" {
+                self.dispatch(UserCommand::Channels);
+            } else {
+                self.dispatch(UserCommand::Join(action));
+            }
+            self.focus = FocusPane::Chat;
+            return;
+        }
+
+        // 4. Pane selection
+        let in_rect = |r: Rect| mx >= r.x && mx < r.x + r.width && my >= r.y && my < r.y + r.height;
+        if in_rect(self.last_board_area.get()) {
+            self.focus = FocusPane::Board;
+        } else if in_rect(self.last_moves_area.get()) {
+            self.focus = FocusPane::Moves;
+        } else if in_rect(self.last_chat_area.get()) {
+            self.focus = FocusPane::Chat;
         }
     }
 
@@ -320,13 +391,19 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.focus = FocusPane::Chat,
+            KeyEvent { code: KeyCode::F(1), .. } => self.dispatch(UserCommand::BoardSize(9)),
+            KeyEvent { code: KeyCode::F(2), .. } => self.dispatch(UserCommand::BoardSize(13)),
+            KeyEvent { code: KeyCode::F(3), .. } => self.dispatch(UserCommand::BoardSize(19)),
+            KeyEvent { code: KeyCode::F(4), .. } => self.dispatch(UserCommand::PresetKo),
+            KeyEvent { code: KeyCode::F(5), .. } => self.dispatch(UserCommand::Estimate(EstimateCommand::Auto)),
+            KeyEvent { code: KeyCode::F(6), .. } => self.dispatch(UserCommand::Estimate(EstimateCommand::Exit)),
+            KeyEvent { code: KeyCode::F(7), .. } => self.dispatch(UserCommand::Step(crate::ui::commands::StepCommand::Prev(1))),
+            KeyEvent { code: KeyCode::F(8), .. } => self.dispatch(UserCommand::Step(crate::ui::commands::StepCommand::Next(1))),
+            KeyEvent { code: KeyCode::F(9), .. } => self.dispatch(UserCommand::Channels),
+            KeyEvent { code: KeyCode::F(10), .. } => self.dispatch(UserCommand::Help),
             KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::CONTROL,
-                ..
-            }
-            | KeyEvent {
-                code: KeyCode::F(5),
                 ..
             } => self.session.send(Command::RefreshLobby),
             KeyEvent {
@@ -566,6 +643,23 @@ impl App {
                 self.session.send(Command::SetBoardSize { game_id, size });
                 self.focus = FocusPane::Board;
                 self.moves_scroll_back = 0;
+            }
+            UserCommand::PresetKo => {
+                let gid = game_id.unwrap_or(42);
+                self.session.send(Command::SetBoardSize { game_id: Some(gid), size: 9 });
+                let demo_moves = [
+                    Coord::new(1, 9),
+                    Coord::new(2, 8),
+                    Coord::new(0, 8),
+                    Coord::new(1, 7),
+                    Coord::new(1, 8),
+                    Coord::new(0, 9),
+                ];
+                for coord in demo_moves {
+                    self.session.send(Command::PlayMove { game_id: gid, coord });
+                }
+                self.focus = FocusPane::Board;
+                self.set_notice("Preset: Ko shape ready at A8/A9. Try capturing [a8]!");
             }
             UserCommand::LoadSgf(game_id) => self.session.send(Command::LoadSgf(game_id)),
             UserCommand::LoadSgfFile(path) => {
@@ -828,6 +922,12 @@ impl App {
 
     fn draw_game(&self, frame: &mut Frame, area: ratatui::layout::Rect, game: &GameView) {
         let layout = layout::split_game(area, game.size);
+        widgets::draw_header(frame, layout.header, &self.theme, game.size, game.estimate_active);
+        self.last_header_area.set(layout.header);
+        self.last_board_area.set(layout.board);
+        self.last_moves_area.set(layout.moves);
+        self.last_chat_area.set(layout.chat);
+
         widgets::render_pane(
             frame,
             layout.board,
@@ -835,7 +935,10 @@ impl App {
             self.theme.board,
             &self.theme,
             self.focus == FocusPane::Board,
-            |frame, inner| widgets::draw_board(frame, inner, game, &self.theme, true),
+            |frame, inner| {
+                self.last_board_inner.set(inner);
+                widgets::draw_board(frame, inner, game, &self.theme, true);
+            },
         );
         widgets::render_pane(
             frame,
@@ -856,6 +959,7 @@ impl App {
             &self.theme,
             self.focus == FocusPane::Chat,
             |frame, inner| {
+                self.last_chat_inner.set(inner);
                 widgets::draw_chat(
                     frame,
                     inner,
@@ -871,6 +975,8 @@ impl App {
 
     fn draw_lobby(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let layout = layout::split_lobby(area);
+        widgets::draw_header(frame, layout.header, &self.theme, 9, false);
+        self.last_header_area.set(layout.header);
         widgets::render_pane(
             frame,
             layout.panel,
@@ -966,7 +1072,8 @@ impl TerminalGuard {
             stdout,
             EnterAlternateScreen,
             cursor::Hide,
-            event::EnableBracketedPaste
+            event::EnableBracketedPaste,
+            event::EnableMouseCapture
         ) {
             let _ = disable_raw_mode();
             return Err(error);
@@ -982,7 +1089,8 @@ impl Drop for TerminalGuard {
             io::stdout(),
             LeaveAlternateScreen,
             cursor::Show,
-            event::DisableBracketedPaste
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture
         );
     }
 }
@@ -1013,7 +1121,8 @@ pub async fn run(session: SessionHandle, startup: Startup) -> io::Result<()> {
             io::stdout(),
             LeaveAlternateScreen,
             cursor::Show,
-            event::DisableBracketedPaste
+            event::DisableBracketedPaste,
+            event::DisableMouseCapture
         );
         original_hook(info);
     }));

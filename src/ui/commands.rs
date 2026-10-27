@@ -41,6 +41,7 @@ pub enum UserCommand {
     Part(String),
     Channels,
     World(String),
+    PresetKo,
     Estimate(EstimateCommand),
     OfficialDead {
         coords: Vec<Coord>,
@@ -233,6 +234,10 @@ pub fn parse(input: &str) -> UserCommand {
             Some(ch) => UserCommand::match_channel("join", ch.trim_start_matches('#')),
         },
         "world" => parse_channel(parts.get(1), "world"),
+        "preset" => match parts.get(1).map(|v| v.to_ascii_lowercase()).as_deref() {
+            Some("ko") | Some("eye") | None => UserCommand::PresetKo,
+            Some(other) => UserCommand::Invalid(format!("unknown preset '{other}' (available: ko)")),
+        },
         "size" | "board" | "new" => match parts.get(1).and_then(|raw| raw.parse::<u8>().ok()) {
             Some(size) if [9, 13, 19].contains(&size) => UserCommand::BoardSize(size),
             _ => UserCommand::Invalid("usage: size <9|13|19> (supported board sizes: 9, 13, 19)".into()),

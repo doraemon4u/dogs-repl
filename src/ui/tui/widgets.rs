@@ -54,6 +54,87 @@ pub fn render_pane(
         return;
     }
     inner(frame, inner_area);
+pub struct HeaderAction {
+    pub label: &'static str,
+    pub key: &'static str,
+    pub cmd: &'static str,
+    pub active: bool,
+}
+
+pub fn header_actions(current_size: u8, estimate_active: bool) -> Vec<HeaderAction> {
+    vec![
+        HeaderAction { label: "9×9", key: "F1", cmd: "size 9", active: current_size == 9 },
+        HeaderAction { label: "13×13", key: "F2", cmd: "size 13", active: current_size == 13 },
+        HeaderAction { label: "19×19", key: "F3", cmd: "size 19", active: current_size == 19 },
+        HeaderAction { label: "打劫死眼", key: "F4", cmd: "preset ko", active: false },
+        HeaderAction { label: "形势判断", key: "F5", cmd: "estimate auto", active: estimate_active },
+        HeaderAction { label: "退出形势", key: "F6", cmd: "estimate exit", active: false },
+        HeaderAction { label: "悔棋", key: "F7", cmd: "prev", active: false },
+        HeaderAction { label: "前进", key: "F8", cmd: "next", active: false },
+        HeaderAction { label: "频道", key: "F9", cmd: "channels", active: false },
+        HeaderAction { label: "帮助", key: "F10", cmd: "help", active: false },
+    ]
+}
+
+/// Top quick actions button bar (matches the web preview).
+pub fn draw_header(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    current_size: u8,
+    estimate_active: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut spans: Vec<Span> = Vec::new();
+    spans.push(Span::styled(" ● ogs-tui ", Style::default().fg(theme.board).add_modifier(Modifier::BOLD)));
+    spans.push(Span::styled("│", Style::default().fg(theme.dim(theme.board))));
+
+    let actions = header_actions(current_size, estimate_active);
+    for (i, action) in actions.iter().enumerate() {
+        if i == 3 || i == 4 || i == 6 || i == 8 {
+            spans.push(Span::styled("│", Style::default().fg(theme.dim(theme.board))));
+        }
+        let style = if action.active {
+            Style::default()
+                .fg(theme.focus(theme.board))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+        spans.push(Span::styled(format!(" [{}:{}]", action.key, action.label), style));
+    }
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// Hit-tests a mouse click on the top header bar to identify the corresponding command.
+pub fn header_action_at(
+    click_x: u16,
+    click_y: u16,
+    area: Rect,
+    current_size: u8,
+    estimate_active: bool,
+) -> Option<&'static str> {
+    if area.width == 0 || area.height == 0 || click_y != area.y {
+        return None;
+    }
+    let mut cur_x = area.x;
+    // Prefix " ● ogs-tui │" has 13 chars
+    cur_x += 13;
+    let actions = header_actions(current_size, estimate_active);
+    for (i, action) in actions.iter().enumerate() {
+        if i == 3 || i == 4 || i == 6 || i == 8 {
+            cur_x += 1;
+        }
+        let btn_len = (format!(" [{}:{}]", action.key, action.label)).chars().count() as u16;
+        if click_x >= cur_x && click_x < cur_x + btn_len {
+            return Some(action.cmd);
+        }
+        cur_x += btn_len;
+    }
+    None
 }
 
 /// Top status bar.
@@ -610,7 +691,29 @@ pub fn draw_moves(
     );
 }
 
-/// Chat pane.
+pub const DEFAULT_CHAT_CHANNELS: &[&str] = &["en", "zh", "ja", "ko", "de", "fr", "es", "ru"];
+
+/// Hit-tests a click inside the chat pane to see if a channel pill was clicked.
+pub fn chat_channel_at(click_x: u16, click_y: u16, area: Rect) -> Option<String> {
+    if area.width == 0 || area.height == 0 || click_y != area.y {
+        return None;
+    }
+    let mut cur_x = area.x;
+    for &ch in DEFAULT_CHAT_CHANNELS {
+        let pill_len = (format!(" #{ch} ")).chars().count() as u16;
+        if click_x >= cur_x && click_x < cur_x + pill_len {
+            return Some(ch.to_string());
+        }
+        cur_x += pill_len;
+    }
+    let more_len = " [+More] ".len() as u16;
+    if click_x >= cur_x && click_x < cur_x + more_len {
+        return Some("channels".to_string());
+    }
+    None
+}
+
+/// Chat pane with top channel pills bar (matches the web preview).
 pub fn draw_chat(
     frame: &mut Frame,
     area: Rect,
@@ -619,6 +722,37 @@ pub fn draw_chat(
     theme: &Theme,
     scroll_back: u16,
 ) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let (bar_area, msg_area) = (vertical[0], vertical[1]);
+
+    // Channel pills bar
+    let mut pills: Vec<Span> = Vec::new();
+    let current_norm = channel.trim_start_matches('#');
+    for &ch in DEFAULT_CHAT_CHANNELS {
+        let is_active = current_norm.eq_ignore_ascii_case(ch);
+        let style = if is_active {
+            Style::default()
+                .fg(theme.focus(theme.chat))
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if store.channels.contains_key(ch) {
+            Style::default().fg(theme.chat)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        pills.push(Span::styled(format!(" #{ch} "), style));
+    }
+    pills.push(Span::styled(
+        " [+More] ",
+        Style::default().fg(theme.dim(theme.chat)),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(pills)), bar_area);
+
     let channel_state = store.channels.get(channel);
     let mut lines: Vec<Line> = Vec::new();
     if let Some(topic) = channel_state.and_then(|state| state.topic.clone()) {
@@ -650,12 +784,12 @@ pub fn draw_chat(
         }
     } else {
         lines.push(Line::from(Span::styled(
-            "no messages yet",
+            "no messages yet (click #channel or type `channels` to browse)",
             Style::default().fg(theme.muted),
         )));
     }
     let total = lines.len() as u16;
-    let view_height = area.height.saturating_sub(1);
+    let view_height = msg_area.height.saturating_sub(1);
     let offset = total
         .saturating_sub(view_height)
         .saturating_sub(scroll_back);
@@ -663,7 +797,7 @@ pub fn draw_chat(
         Paragraph::new(lines)
             .scroll((offset, 0))
             .wrap(Wrap { trim: true }),
-        area,
+        msg_area,
     );
 }
 
