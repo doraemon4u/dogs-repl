@@ -54,6 +54,8 @@ pub fn render_pane(
         return;
     }
     inner(frame, inner_area);
+}
+
 pub struct HeaderAction {
     pub label: &'static str,
     pub key: &'static str,

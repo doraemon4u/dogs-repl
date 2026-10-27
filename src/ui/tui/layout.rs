@@ -92,7 +92,7 @@ pub fn too_small(area: Rect, scene: Scene) -> Option<(u16, u16)> {
 }
 
 /// Splits the game screen into header, board, moves, chat, status, and input.
-pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
+pub fn split_game(area: Rect, _board_size: u8) -> GameLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([

@@ -428,6 +428,23 @@ impl Repl {
             UserCommand::BoardSize(size) => {
                 self.session.send(Command::SetBoardSize { game_id, size });
             }
+            UserCommand::PresetKo => {
+                let gid = game_id.unwrap_or(42);
+                self.session
+                    .send(Command::SetBoardSize { game_id: Some(gid), size: 9 });
+                let demo_moves = [
+                    crate::engine::coord::Coord::new(1, 9),
+                    crate::engine::coord::Coord::new(2, 8),
+                    crate::engine::coord::Coord::new(0, 8),
+                    crate::engine::coord::Coord::new(1, 7),
+                    crate::engine::coord::Coord::new(1, 8),
+                    crate::engine::coord::Coord::new(0, 9),
+                ];
+                for coord in demo_moves {
+                    self.session.send(Command::PlayMove { game_id: gid, coord });
+                }
+                println!("[i] Preset: Ko shape ready at A8/A9. Try capturing [a8]!");
+            }
             UserCommand::LoadSgf(game_id) => {
                 self.session.send(Command::LoadSgf(game_id));
                 println!("[..] loading SGF for game {game_id}…");
