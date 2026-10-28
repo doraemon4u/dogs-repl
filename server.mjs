@@ -188,9 +188,10 @@ const HTML_PAGE = `<!DOCTYPE html>
       align-items: center;
       justify-content: center;
       background: #0f141c;
-      border: 1px solid #262c36;
-      border-radius: 4px;
-      padding: 4px;
+      border: 2px solid #58a6ff;
+      box-shadow: 0 0 16px rgba(88, 166, 255, 0.16), inset 0 0 10px rgba(0, 0, 0, 0.6);
+      border-radius: 6px;
+      padding: 6px;
       flex-shrink: 0;
     }
     .board-svg {
@@ -1301,8 +1302,11 @@ const HTML_PAGE = `<!DOCTYPE html>
           <stop offset="100%" stop-color="#b1bac4" />
         </radialGradient>
       </defs>\`;
-      // Subtle board surface
+      // Subtle board surface & outer line frame (外边线条框绘制)
       svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="8" fill="#0f141c" />\`;
+      // Outer line box frame enclosing board and coordinates
+      svg += \`<rect x="10" y="10" width="\${V - 20}" height="\${V - 20}" rx="6" fill="none" stroke="#58a6ff" stroke-width="2.6" />\`;
+      svg += \`<rect x="16" y="16" width="\${V - 32}" height="\${V - 32}" rx="4" fill="none" stroke="#21262d" stroke-width="1.2" />\`;
 
       // Coordinate labels (Top, Bottom, Left, Right)
       for (let c = 0; c < size; c++) {
@@ -1318,9 +1322,10 @@ const HTML_PAGE = `<!DOCTYPE html>
         svg += \`<text x="\${(V - pad * 0.40).toFixed(2)}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
       }
 
-      // Square Grid Lines (Horizontal & Vertical lines)
+      // Square Grid Lines (Horizontal & Vertical lines) and outer perimeter line frame
       const start = pad.toFixed(2);
       const end = (V - pad).toFixed(2);
+      svg += \`<rect x="\${start}" y="\${start}" width="\${(V - pad * 2).toFixed(2)}" height="\${(V - pad * 2).toFixed(2)}" fill="none" stroke="#8b949e" stroke-width="3.2" />\`;
       for (let i = 0; i < size; i++) {
         const pos = (pad + i * step).toFixed(2);
         const isBorder = i === 0 || i === size - 1;

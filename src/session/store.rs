@@ -686,13 +686,16 @@ impl Store {
         let world_channel = world_channel.into();
         let mut channels = BTreeMap::new();
         channels.insert(world_channel.clone(), ChannelState::default());
+        let mut games = BTreeMap::new();
+        let default_view = GameView::empty(42, 9);
+        games.insert(42, default_view);
         Self {
             connection: ConnectionState::Offline,
             connection_message: None,
             username: None,
             user_id: None,
-            games: BTreeMap::new(),
-            active_game: None,
+            games,
+            active_game: Some(42),
             chat_scope: ChatScope::World {
                 channel: world_channel.clone(),
             },

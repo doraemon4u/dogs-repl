@@ -781,7 +781,7 @@ impl Actor {
             .games
             .get(&game_id)
             .map(|game| game.size)
-            .unwrap_or(19);
+            .unwrap_or(9);
         state
             .games
             .entry(game_id)
@@ -824,7 +824,7 @@ impl Actor {
                     Some(game.validate_move(coord)),
                     game.connected,
                 ),
-                None => (19, crate::session::store::GamePhase::Play, None, None, true),
+                None => (9, crate::session::store::GamePhase::Play, None, None, true),
             }
         };
         let (size, phase, to_play, rule_check, is_connected_game) = validation;
@@ -1221,7 +1221,7 @@ impl Actor {
                 .filter_map(|&(col, row)| {
                     let coord = Coord::new(col, row);
                     coord
-                        .is_on_board(state.game(game_id).map(|game| game.size).unwrap_or(19))
+                        .is_on_board(state.game(game_id).map(|game| game.size).unwrap_or(9))
                         .then(|| coord.to_gtp())
                 })
                 .collect::<Vec<_>>()

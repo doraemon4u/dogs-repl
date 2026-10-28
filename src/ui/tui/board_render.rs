@@ -327,29 +327,24 @@ pub fn draw_board(
     });
     let grid_line_style = Style::default().fg(muted);
 
-    // Optional Pass 0: Draw a strict 1:1 visual square Goban outer border (`frame_w == 2 * frame_h`)
-    // around the centered square board when space permits inside the Board pane.
-    if m.origin_y > area.y && m.origin_y + m.total_h < area.y + area.height {
-        let frame_h = m.total_h + 2;
-        let ideal_frame_w = (frame_h * 2).max(m.total_w + 2);
-        if ideal_frame_w <= area.width {
-            let fx0 = area.x + area.width.saturating_sub(ideal_frame_w) / 2;
-            let fy0 = m.origin_y - 1;
-            let fx1 = fx0 + ideal_frame_w - 1;
-            let fy1 = fy0 + frame_h - 1;
-            let border_st = Style::default().fg(muted);
-            buffer.set_string(fx0, fy0, "┏", border_st);
-            buffer.set_string(fx1, fy0, "┓", border_st);
-            buffer.set_string(fx0, fy1, "┗", border_st);
-            buffer.set_string(fx1, fy1, "┛", border_st);
-            for cx in (fx0 + 1)..fx1 {
-                buffer.set_string(cx, fy0, "━", border_st);
-                buffer.set_string(cx, fy1, "━", border_st);
-            }
-            for cy in (fy0 + 1)..fy1 {
-                buffer.set_string(fx0, cy, "┃", border_st);
-                buffer.set_string(fx1, cy, "┃", border_st);
-            }
+    // Pass 0: Draw an outer line box frame enclosing the board (外边用线条框绘制)
+    let fx0 = m.origin_x.saturating_sub(1);
+    let fy0 = m.origin_y.saturating_sub(1);
+    let fx1 = (m.origin_x + m.total_w).min(area.x + area.width.saturating_sub(1));
+    let fy1 = (m.origin_y + m.total_h).min(area.y + area.height.saturating_sub(1));
+    if fx0 >= area.x && fx1 > fx0 + 2 && fy0 >= area.y && fy1 > fy0 + 2 {
+        let border_st = Style::default().fg(if focused { theme.focus(theme.board) } else { muted });
+        buffer.set_string(fx0, fy0, "┏", border_st);
+        buffer.set_string(fx1, fy0, "┓", border_st);
+        buffer.set_string(fx0, fy1, "┗", border_st);
+        buffer.set_string(fx1, fy1, "┛", border_st);
+        for cx in (fx0 + 1)..fx1 {
+            buffer.set_string(cx, fy0, "━", border_st);
+            buffer.set_string(cx, fy1, "━", border_st);
+        }
+        for cy in (fy0 + 1)..fy1 {
+            buffer.set_string(fx0, cy, "┃", border_st);
+            buffer.set_string(fx1, cy, "┃", border_st);
         }
     }
 

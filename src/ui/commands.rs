@@ -102,7 +102,7 @@ impl Default for ChallengeSpec {
     fn default() -> Self {
         Self {
             opponent: String::new(),
-            board_size: 19,
+            board_size: 9,
             rules: "chinese".to_string(),
             ranked: true,
             color: "automatic".to_string(),

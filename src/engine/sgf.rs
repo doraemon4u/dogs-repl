@@ -366,7 +366,7 @@ impl Parser<'_> {
             return Err(SgfError::InvalidFormat);
         }
         let mut game = SgfGame {
-            board_size: 19,
+            board_size: 9,
             komi: 6.5,
             ..SgfGame::default()
         };
