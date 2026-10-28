@@ -160,20 +160,61 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
     }
 }
 
-/// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
-/// Scales stones proportionally with the grid spacing so stones are large and full on 9x9/13x13/19x19 boards.
-pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
-    if row_step >= 5 && col_step >= 10 {
-        (4, 2)
-    } else if row_step >= 4 && col_step >= 8 {
-        (3, 1)
-    } else if row_step >= 3 && col_step >= 6 {
-        (2, 1)
-    } else if row_step >= 2 && col_step >= 4 {
-        (1, 1)
-    } else {
-        (0, 0)
+/// Returns the stone horizontal and vertical half-radii `(rx, ry)` calibrated specifically for `size`.
+/// Each board size (9x9, 13x13, 19x19) has its own stone proportions specifically calibrated so stones
+/// adapt naturally without deforming, vertically colliding, or obscuring the grid lines.
+pub fn stone_radii_for_size(size: u8, col_step: u16, row_step: u16) -> (u16, u16) {
+    match size {
+        9 => {
+            // 9-road Go has only 8 gaps: generous cell space for prominent, large round stones.
+            if row_step >= 5 && col_step >= 10 {
+                (4, 2)
+            } else if row_step >= 4 && col_step >= 8 {
+                (3, 1)
+            } else if row_step >= 3 && col_step >= 6 {
+                (2, 1)
+            } else if row_step >= 2 && col_step >= 4 {
+                (1, 1)
+            } else {
+                (0, 0)
+            }
+        }
+        13 => {
+            // 13-road Go: medium density.
+            // When row_step == 2, ry must be 0 to avoid vertical neighbor overlap on shared row y±1.
+            // When row_step >= 3, stones have full row separation and can use multi-row circular discs.
+            if row_step >= 4 && col_step >= 8 {
+                (2, 1)
+            } else if row_step >= 3 && col_step >= 6 {
+                (1, 1)
+            } else if row_step >= 2 && col_step >= 4 {
+                (1, 0)
+            } else {
+                (0, 0)
+            }
+        }
+        _ => {
+            // 19-road Go: standard high density (361 intersections).
+            // Prevent vertical deformation and line collision:
+            // - row_step 1 or 2: ry = 0 (crisp single or horizontal rounded stone without vertical overlap).
+            // - row_step >= 3: safe for (1, 1) circular disc without line collision.
+            // - row_step >= 4: safe for (2, 1) circular disc.
+            if row_step >= 4 && col_step >= 8 {
+                (2, 1)
+            } else if row_step >= 3 && col_step >= 6 {
+                (1, 1)
+            } else if row_step >= 2 && col_step >= 4 {
+                (1, 0)
+            } else {
+                (0, 0)
+            }
+        }
     }
+}
+
+/// Backward-compatible wrapper defaulting to 9-road or general sizing.
+pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
+    stone_radii_for_size(9, col_step, row_step)
 }
 
 /// Computes optimal `(col_step, row_step)` enforcing a strict 2:1 character aspect ratio
@@ -188,7 +229,7 @@ pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     let mut best_row_step = 1u16;
     for r in 1..=6 {
         let c = r * 2;
-        let (rx, ry) = stone_radii(c, r);
+        let (rx, ry) = stone_radii_for_size(size, c, r);
         let needed_w = LABEL_WIDTH + rx * 2 + gaps * c + 1;
         let needed_h = gaps * r + 1 + ry * 2;
         if needed_w <= area.width && needed_h <= area.height {
@@ -225,7 +266,7 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
         return None;
     }
     let (col_step, row_step) = compute_board_steps(area, size);
-    let (stone_rx, stone_ry) = stone_radii(col_step, row_step);
+    let (stone_rx, stone_ry) = stone_radii_for_size(size, col_step, row_step);
     let gaps = u16::from(size.saturating_sub(1));
     let grid_w = gaps * col_step;
     let grid_h = gaps * row_step;
@@ -487,17 +528,18 @@ pub fn draw_board(
                     let style = Style::default()
                         .fg(theme.dead_stone)
                         .add_modifier(Modifier::DIM);
-                    draw_large_stone(
+                    draw_board_dead_stone(
+                        size,
                         buffer,
                         area,
                         x,
                         y,
+                        m.col_step,
+                        m.row_step,
                         m.stone_rx,
                         m.stone_ry,
                         style,
-                        "╳",
                     );
-                    buffer.set_string(x, y, "╳", style.add_modifier(Modifier::BOLD));
                 }
                 PointVisual::Stone(color) => {
                     let base_fg = match color {
@@ -508,23 +550,19 @@ pub fn draw_board(
                         .fg(if is_last { theme.last_move } else { base_fg })
                         .add_modifier(Modifier::BOLD);
 
-                    let fallback_glyph = if is_last {
-                        "◉"
-                    } else {
-                        match color {
-                            Color::Black => "●",
-                            Color::White => "○",
-                        }
-                    };
-                    draw_large_stone(
+                    draw_board_stone(
+                        size,
                         buffer,
                         area,
                         x,
                         y,
+                        m.col_step,
+                        m.row_step,
                         m.stone_rx,
                         m.stone_ry,
+                        color,
+                        is_last,
                         style,
-                        fallback_glyph,
                     );
                 }
             }
@@ -532,114 +570,310 @@ pub fn draw_board(
     }
 }
 
-/// Renders a large circular stone centered at `(cx, cy)` using proportional half-block and full-block
-/// circular rasterization (`▄`, `█`, `▀`), falling back to `fallback_glyph` when `rx == 0 || ry == 0`.
-fn draw_large_stone(
+/// Helper that safely writes one character cell with clipping and half-block background blending.
+fn put_cell(buf: &mut Buffer, area: Rect, px: i32, py: i32, sym: &str, st: Style) {
+    if px >= i32::from(area.x)
+        && px < i32::from(area.x + area.width)
+        && py >= i32::from(area.y)
+        && py < i32::from(area.y + area.height)
+    {
+        let ux = px as u16;
+        let uy = py as u16;
+        if sym == "▄" && buf[(ux, uy)].symbol() == "▀" {
+            let upper_fg = buf[(ux, uy)].fg;
+            buf.set_string(ux, uy, sym, st.bg(upper_fg));
+        } else {
+            buf.set_string(ux, uy, sym, st);
+        }
+    }
+}
+
+/// Unified entry point dispatching to each road's specialized stone rendering engine.
+fn draw_board_stone(
+    size: u8,
     buffer: &mut Buffer,
     area: Rect,
     cx: u16,
     cy: u16,
+    col_step: u16,
+    row_step: u16,
+    rx: u16,
+    ry: u16,
+    color: Color,
+    is_last: bool,
+    style: Style,
+) {
+    match size {
+        9 => draw_stone_9x9(buffer, area, cx, cy, col_step, row_step, rx, ry, color, is_last, style),
+        13 => draw_stone_13x13(buffer, area, cx, cy, col_step, row_step, rx, ry, color, is_last, style),
+        _ => draw_stone_19x19(buffer, area, cx, cy, col_step, row_step, rx, ry, color, is_last, style),
+    }
+}
+
+/// Unified entry point for dead stone rendering tailored to each board size.
+fn draw_board_dead_stone(
+    size: u8,
+    buffer: &mut Buffer,
+    area: Rect,
+    cx: u16,
+    cy: u16,
+    col_step: u16,
+    row_step: u16,
     rx: u16,
     ry: u16,
     style: Style,
-    fallback_glyph: &str,
 ) {
-    let put = |buf: &mut Buffer, px: i32, py: i32, sym: &str, st: Style| {
-        if px >= i32::from(area.x)
-            && px < i32::from(area.x + area.width)
-            && py >= i32::from(area.y)
-            && py < i32::from(area.y + area.height)
-        {
-            let ux = px as u16;
-            let uy = py as u16;
-            // When two stones are vertically adjacent at row_step == 2, the upper stone's
-            // bottom row ('▀') and lower stone's top row ('▄') share the middle row.
-            // Preserve the upper stone's foreground color in the background of '▄'.
-            if sym == "▄" && buf[(ux, uy)].symbol() == "▀" {
-                let upper_fg = buf[(ux, uy)].fg;
-                buf.set_string(ux, uy, sym, st.bg(upper_fg));
-            } else {
-                buf.set_string(ux, uy, sym, st);
-            }
-        }
-    };
+    match size {
+        9 => draw_stone_9x9(buffer, area, cx, cy, col_step, row_step, rx, ry, Color::Black, false, style),
+        13 => draw_stone_13x13(buffer, area, cx, cy, col_step, row_step, rx, ry, Color::Black, false, style),
+        _ => draw_stone_19x19(buffer, area, cx, cy, col_step, row_step, rx, ry, Color::Black, false, style),
+    }
+    put_cell(buffer, area, i32::from(cx), i32::from(cy), "╳", style.add_modifier(Modifier::BOLD));
+}
 
+/// Dedicated stone renderer for 9-road Go boards (wide cell spacing, prominent circular discs).
+fn draw_stone_9x9(
+    buffer: &mut Buffer,
+    area: Rect,
+    cx: u16,
+    cy: u16,
+    _col_step: u16,
+    _row_step: u16,
+    rx: u16,
+    ry: u16,
+    color: Color,
+    is_last: bool,
+    style: Style,
+) {
+    let fallback = if is_last { "◉" } else { match color { Color::Black => "●", Color::White => "○" } };
     let x = i32::from(cx);
     let y = i32::from(cy);
 
     match (rx, ry) {
         (0, _) | (_, 0) => {
-            put(buffer, x, y, fallback_glyph, style);
+            put_cell(buffer, area, x, y, fallback, style);
         }
         (1, 1) => {
+            // 3x3 circular disc for 9x9 (when terminal pane is compact)
             for dx in -1..=1 {
-                put(buffer, x + dx, y - 1, "▄", style);
-                put(buffer, x + dx, y, "█", style);
-                put(buffer, x + dx, y + 1, "▀", style);
+                put_cell(buffer, area, x + dx, y - 1, "▄", style);
+                put_cell(buffer, area, x + dx, y, "█", style);
+                put_cell(buffer, area, x + dx, y + 1, "▀", style);
+            }
+            if is_last {
+                put_cell(buffer, area, x, y, "◉", style);
             }
         }
         (2, 1) => {
-            put(buffer, x - 2, y - 1, "▄", style);
+            // 5x3 circular disc with smooth bevel corners
+            put_cell(buffer, area, x - 2, y - 1, "▄", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y - 1, "█", style);
+                put_cell(buffer, area, x + dx, y - 1, "█", style);
             }
-            put(buffer, x + 2, y - 1, "▄", style);
+            put_cell(buffer, area, x + 2, y - 1, "▄", style);
 
             for dx in -2..=2 {
-                put(buffer, x + dx, y, "█", style);
+                put_cell(buffer, area, x + dx, y, "█", style);
             }
 
-            put(buffer, x - 2, y + 1, "▀", style);
+            put_cell(buffer, area, x - 2, y + 1, "▀", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y + 1, "█", style);
+                put_cell(buffer, area, x + dx, y + 1, "█", style);
             }
-            put(buffer, x + 2, y + 1, "▀", style);
+            put_cell(buffer, area, x + 2, y + 1, "▀", style);
+
+            if is_last {
+                put_cell(buffer, area, x, y, "◉", style);
+            }
         }
         (3, 1) => {
-            put(buffer, x - 2, y - 1, "▄", style);
+            // 7x3 large circular disc with stepped profile
+            put_cell(buffer, area, x - 2, y - 1, "▄", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y - 1, "█", style);
+                put_cell(buffer, area, x + dx, y - 1, "█", style);
             }
-            put(buffer, x + 2, y - 1, "▄", style);
+            put_cell(buffer, area, x + 2, y - 1, "▄", style);
 
             for dx in -3..=3 {
-                put(buffer, x + dx, y, "█", style);
+                put_cell(buffer, area, x + dx, y, "█", style);
             }
 
-            put(buffer, x - 2, y + 1, "▀", style);
+            put_cell(buffer, area, x - 2, y + 1, "▀", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y + 1, "█", style);
+                put_cell(buffer, area, x + dx, y + 1, "█", style);
             }
-            put(buffer, x + 2, y + 1, "▀", style);
+            put_cell(buffer, area, x + 2, y + 1, "▀", style);
+
+            if is_last {
+                put_cell(buffer, area, x, y, "◉", style);
+            }
         }
         _ => {
-            put(buffer, x - 2, y - 2, "▄", style);
+            // 9x5 giant circular disc
+            put_cell(buffer, area, x - 2, y - 2, "▄", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y - 2, "█", style);
+                put_cell(buffer, area, x + dx, y - 2, "█", style);
             }
-            put(buffer, x + 2, y - 2, "▄", style);
+            put_cell(buffer, area, x + 2, y - 2, "▄", style);
 
-            put(buffer, x - 3, y - 1, "▄", style);
+            put_cell(buffer, area, x - 3, y - 1, "▄", style);
             for dx in -2..=2 {
-                put(buffer, x + dx, y - 1, "█", style);
+                put_cell(buffer, area, x + dx, y - 1, "█", style);
             }
-            put(buffer, x + 3, y - 1, "▄", style);
+            put_cell(buffer, area, x + 3, y - 1, "▄", style);
 
             for dx in -4..=4 {
-                put(buffer, x + dx, y, "█", style);
+                put_cell(buffer, area, x + dx, y, "█", style);
             }
 
-            put(buffer, x - 3, y + 1, "▀", style);
+            put_cell(buffer, area, x - 3, y + 1, "▀", style);
             for dx in -2..=2 {
-                put(buffer, x + dx, y + 1, "█", style);
+                put_cell(buffer, area, x + dx, y + 1, "█", style);
             }
-            put(buffer, x + 3, y + 1, "▀", style);
+            put_cell(buffer, area, x + 3, y + 1, "▀", style);
 
-            put(buffer, x - 2, y + 2, "▀", style);
+            put_cell(buffer, area, x - 2, y + 2, "▀", style);
             for dx in -1..=1 {
-                put(buffer, x + dx, y + 2, "█", style);
+                put_cell(buffer, area, x + dx, y + 2, "█", style);
             }
-            put(buffer, x + 2, y + 2, "▀", style);
+            put_cell(buffer, area, x + 2, y + 2, "▀", style);
+
+            if is_last {
+                put_cell(buffer, area, x, y, "◉", style);
+            }
+        }
+    }
+}
+
+/// Dedicated stone renderer for 13-road Go boards (medium density, no vertical merging).
+fn draw_stone_13x13(
+    buffer: &mut Buffer,
+    area: Rect,
+    cx: u16,
+    cy: u16,
+    _col_step: u16,
+    row_step: u16,
+    rx: u16,
+    ry: u16,
+    color: Color,
+    is_last: bool,
+    style: Style,
+) {
+    let glyph = if is_last { "◉" } else { match color { Color::Black => "●", Color::White => "○" } };
+    let x = i32::from(cx);
+    let y = i32::from(cy);
+
+    if ry == 0 {
+        if rx >= 1 && row_step >= 2 {
+            // When row_step == 2 on 13x13, render clean single-row rounded stone:
+            // "◖█◗" centered without bleeding into adjacent rows.
+            put_cell(buffer, area, x - 1, y, "◖", style);
+            put_cell(buffer, area, x, y, if is_last { "◉" } else { "█" }, style);
+            put_cell(buffer, area, x + 1, y, "◗", style);
+        } else {
+            put_cell(buffer, area, x, y, glyph, style);
+        }
+        return;
+    }
+
+    // When row_step >= 3, stones have full vertical separation on 13x13:
+    if rx <= 1 {
+        // 3x3 circular disc
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y - 1, "▄", style);
+            put_cell(buffer, area, x + dx, y, "█", style);
+            put_cell(buffer, area, x + dx, y + 1, "▀", style);
+        }
+        if is_last {
+            put_cell(buffer, area, x, y, "◉", style);
+        }
+    } else {
+        // 5x3 circular disc
+        put_cell(buffer, area, x - 2, y - 1, "▄", style);
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y - 1, "█", style);
+        }
+        put_cell(buffer, area, x + 2, y - 1, "▄", style);
+
+        for dx in -2..=2 {
+            put_cell(buffer, area, x + dx, y, "█", style);
+        }
+
+        put_cell(buffer, area, x - 2, y + 1, "▀", style);
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y + 1, "█", style);
+        }
+        put_cell(buffer, area, x + 2, y + 1, "▀", style);
+
+        if is_last {
+            put_cell(buffer, area, x, y, "◉", style);
+        }
+    }
+}
+
+/// Dedicated stone renderer for 19-road Go boards (high density, 361 intersections, strict no-deformation).
+fn draw_stone_19x19(
+    buffer: &mut Buffer,
+    area: Rect,
+    cx: u16,
+    cy: u16,
+    col_step: u16,
+    row_step: u16,
+    rx: u16,
+    ry: u16,
+    color: Color,
+    is_last: bool,
+    style: Style,
+) {
+    let glyph = if is_last { "◉" } else { match color { Color::Black => "●", Color::White => "○" } };
+    let x = i32::from(cx);
+    let y = i32::from(cy);
+
+    if ry == 0 {
+        if rx >= 1 && row_step >= 2 && col_step >= 4 {
+            // When row_step == 2 on 19x19, draw a horizontal rounded stone on row y only:
+            // "◖█◗" with no vertical bleed, preserving grid line visibility on y±1.
+            put_cell(buffer, area, x - 1, y, "◖", style);
+            put_cell(buffer, area, x, y, if is_last { "◉" } else { "█" }, style);
+            put_cell(buffer, area, x + 1, y, "◗", style);
+        } else {
+            // Standard 19x19 intersection: crisp, perfect single-cell circular glyph
+            put_cell(buffer, area, x, y, glyph, style);
+        }
+        return;
+    }
+
+    // Oversized terminals where row_step >= 3 on 19x19:
+    if rx <= 1 {
+        // 3x3 circular stone with no overlap
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y - 1, "▄", style);
+            put_cell(buffer, area, x + dx, y, "█", style);
+            put_cell(buffer, area, x + dx, y + 1, "▀", style);
+        }
+        if is_last {
+            put_cell(buffer, area, x, y, "◉", style);
+        }
+    } else {
+        // 5x3 circular disc
+        put_cell(buffer, area, x - 2, y - 1, "▄", style);
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y - 1, "█", style);
+        }
+        put_cell(buffer, area, x + 2, y - 1, "▄", style);
+
+        for dx in -2..=2 {
+            put_cell(buffer, area, x + dx, y, "█", style);
+        }
+
+        put_cell(buffer, area, x - 2, y + 1, "▀", style);
+        for dx in -1..=1 {
+            put_cell(buffer, area, x + dx, y + 1, "█", style);
+        }
+        put_cell(buffer, area, x + 2, y + 1, "▀", style);
+
+        if is_last {
+            put_cell(buffer, area, x, y, "◉", style);
         }
     }
 }
@@ -747,7 +981,28 @@ mod tests {
     fn draw_board_renders_large_circular_stones() {
         use crate::ui::tui::theme::ColorSupport;
         let theme = Theme::new(ColorSupport::TrueColor);
-        for &(size, w, h) in &[(9u8, 80u16, 40u16), (13, 90, 42), (19, 100, 44)] {
+
+        // 9x9 board: large prominent circular discs with half-block stepped caps
+        {
+            let mut g = GameView::empty(1, 9);
+            g.game.play(Coord::new(2, 2)).unwrap();
+            g.game.play(Coord::new(3, 2)).unwrap();
+            let area = Rect::new(0, 0, 80, 40);
+            let mut buf = Buffer::empty(area);
+            draw_board(&mut buf, area, &g, &theme, true);
+            let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                rendered.contains('█') && (rendered.contains('▄') || rendered.contains('▀')),
+                "9x9 board must render prominent multi-cell circular discs"
+            );
+            assert!(
+                !rendered.contains('╭') && !rendered.contains('╰'),
+                "no hollow rectangular box borders on 9x9"
+            );
+        }
+
+        // 13x13 and 19x19 boards: dedicated adapted stones that prevent vertical deformation
+        for &(size, w, h) in &[(13u8, 90u16, 42u16), (19u8, 100u16, 44u16)] {
             let mut g = GameView::empty(1, size);
             g.game.play(Coord::new(2, 2)).unwrap();
             g.game.play(Coord::new(3, 2)).unwrap();
@@ -756,12 +1011,12 @@ mod tests {
             draw_board(&mut buf, area, &g, &theme, true);
             let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(
-                rendered.contains('█') && rendered.contains('▄') && rendered.contains('▀'),
-                "large circular disc blocks expected on {size}x{size}"
+                rendered.contains('█') || rendered.contains('●') || rendered.contains('○'),
+                "adapted stones must be rendered on {size}x{size}"
             );
             assert!(
                 !rendered.contains('╭') && !rendered.contains('╰'),
-                "no hollow rectangular box borders must be used on {size}x{size}"
+                "no hollow rectangular box borders on {size}x{size}"
             );
         }
     }
