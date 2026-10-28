@@ -161,9 +161,19 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
 }
 
 /// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
-/// Stones are rendered as pure circular glyphs directly on intersections (rx = 0, ry = 0).
-pub fn stone_radii(_col_step: u16, _row_step: u16) -> (u16, u16) {
-    (0, 0)
+/// Scales stones proportionally with the grid spacing so stones are large and full on 9x9/13x13/19x19 boards.
+pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
+    if row_step >= 5 && col_step >= 10 {
+        (4, 2)
+    } else if row_step >= 4 && col_step >= 8 {
+        (3, 1)
+    } else if row_step >= 3 && col_step >= 6 {
+        (2, 1)
+    } else if row_step >= 2 && col_step >= 4 {
+        (1, 1)
+    } else {
+        (0, 0)
+    }
 }
 
 /// Computes optimal `(col_step, row_step)` enforcing a strict 2:1 character aspect ratio
@@ -178,8 +188,9 @@ pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     let mut best_row_step = 1u16;
     for r in 1..=6 {
         let c = r * 2;
-        let needed_w = LABEL_WIDTH + gaps * c + 1;
-        let needed_h = gaps * r + 1;
+        let (rx, ry) = stone_radii(c, r);
+        let needed_w = LABEL_WIDTH + rx * 2 + gaps * c + 1;
+        let needed_h = gaps * r + 1 + ry * 2;
         if needed_w <= area.width && needed_h <= area.height {
             best_row_step = r;
         } else {
@@ -228,6 +239,8 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
     let show_top_coords = area.height >= grid_h + 2;
     let top_pad = if area.height >= grid_h + 2 + stone_ry * 2 {
         1 + stone_ry
+    } else if area.height >= grid_h + 1 + stone_ry {
+        stone_ry.max(u16::from(show_top_coords))
     } else if show_top_coords {
         1
     } else {
@@ -241,14 +254,14 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
     } else {
         min_w
     };
-    let total_h = top_pad
-        + grid_h
-        + 1
-        + if show_bottom_coords {
-            stone_ry + 1
-        } else {
-            0
-        };
+    let bottom_pad = if show_bottom_coords {
+        stone_ry + 1
+    } else if area.height >= top_pad + grid_h + 1 + stone_ry {
+        stone_ry
+    } else {
+        0
+    };
+    let total_h = top_pad + grid_h + 1 + bottom_pad;
 
     let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
     let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
@@ -474,7 +487,17 @@ pub fn draw_board(
                     let style = Style::default()
                         .fg(theme.dead_stone)
                         .add_modifier(Modifier::DIM);
-                    buffer.set_string(x, y, "╳", style);
+                    draw_large_stone(
+                        buffer,
+                        area,
+                        x,
+                        y,
+                        m.stone_rx,
+                        m.stone_ry,
+                        style,
+                        "╳",
+                    );
+                    buffer.set_string(x, y, "╳", style.add_modifier(Modifier::BOLD));
                 }
                 PointVisual::Stone(color) => {
                     let base_fg = match color {
@@ -485,7 +508,7 @@ pub fn draw_board(
                         .fg(if is_last { theme.last_move } else { base_fg })
                         .add_modifier(Modifier::BOLD);
 
-                    let glyph = if is_last {
+                    let fallback_glyph = if is_last {
                         "◉"
                     } else {
                         match color {
@@ -493,9 +516,130 @@ pub fn draw_board(
                             Color::White => "○",
                         }
                     };
-                    buffer.set_string(x, y, glyph, style);
+                    draw_large_stone(
+                        buffer,
+                        area,
+                        x,
+                        y,
+                        m.stone_rx,
+                        m.stone_ry,
+                        style,
+                        fallback_glyph,
+                    );
                 }
             }
+        }
+    }
+}
+
+/// Renders a large circular stone centered at `(cx, cy)` using proportional half-block and full-block
+/// circular rasterization (`▄`, `█`, `▀`), falling back to `fallback_glyph` when `rx == 0 || ry == 0`.
+fn draw_large_stone(
+    buffer: &mut Buffer,
+    area: Rect,
+    cx: u16,
+    cy: u16,
+    rx: u16,
+    ry: u16,
+    style: Style,
+    fallback_glyph: &str,
+) {
+    let put = |buf: &mut Buffer, px: i32, py: i32, sym: &str, st: Style| {
+        if px >= i32::from(area.x)
+            && px < i32::from(area.x + area.width)
+            && py >= i32::from(area.y)
+            && py < i32::from(area.y + area.height)
+        {
+            let ux = px as u16;
+            let uy = py as u16;
+            // When two stones are vertically adjacent at row_step == 2, the upper stone's
+            // bottom row ('▀') and lower stone's top row ('▄') share the middle row.
+            // Preserve the upper stone's foreground color in the background of '▄'.
+            if sym == "▄" && buf[(ux, uy)].symbol() == "▀" {
+                let upper_fg = buf[(ux, uy)].fg;
+                buf.set_string(ux, uy, sym, st.bg(upper_fg));
+            } else {
+                buf.set_string(ux, uy, sym, st);
+            }
+        }
+    };
+
+    let x = i32::from(cx);
+    let y = i32::from(cy);
+
+    match (rx, ry) {
+        (0, _) | (_, 0) => {
+            put(buffer, x, y, fallback_glyph, style);
+        }
+        (1, 1) => {
+            for dx in -1..=1 {
+                put(buffer, x + dx, y - 1, "▄", style);
+                put(buffer, x + dx, y, "█", style);
+                put(buffer, x + dx, y + 1, "▀", style);
+            }
+        }
+        (2, 1) => {
+            put(buffer, x - 2, y - 1, "▄", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y - 1, "█", style);
+            }
+            put(buffer, x + 2, y - 1, "▄", style);
+
+            for dx in -2..=2 {
+                put(buffer, x + dx, y, "█", style);
+            }
+
+            put(buffer, x - 2, y + 1, "▀", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y + 1, "█", style);
+            }
+            put(buffer, x + 2, y + 1, "▀", style);
+        }
+        (3, 1) => {
+            put(buffer, x - 2, y - 1, "▄", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y - 1, "█", style);
+            }
+            put(buffer, x + 2, y - 1, "▄", style);
+
+            for dx in -3..=3 {
+                put(buffer, x + dx, y, "█", style);
+            }
+
+            put(buffer, x - 2, y + 1, "▀", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y + 1, "█", style);
+            }
+            put(buffer, x + 2, y + 1, "▀", style);
+        }
+        _ => {
+            put(buffer, x - 2, y - 2, "▄", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y - 2, "█", style);
+            }
+            put(buffer, x + 2, y - 2, "▄", style);
+
+            put(buffer, x - 3, y - 1, "▄", style);
+            for dx in -2..=2 {
+                put(buffer, x + dx, y - 1, "█", style);
+            }
+            put(buffer, x + 3, y - 1, "▄", style);
+
+            for dx in -4..=4 {
+                put(buffer, x + dx, y, "█", style);
+            }
+
+            put(buffer, x - 3, y + 1, "▀", style);
+            for dx in -2..=2 {
+                put(buffer, x + dx, y + 1, "█", style);
+            }
+            put(buffer, x + 3, y + 1, "▀", style);
+
+            put(buffer, x - 2, y + 2, "▀", style);
+            for dx in -1..=1 {
+                put(buffer, x + dx, y + 2, "█", style);
+            }
+            put(buffer, x + 2, y + 2, "▀", style);
         }
     }
 }
@@ -600,10 +744,10 @@ mod tests {
     }
 
     #[test]
-    fn draw_board_renders_circular_stones_not_rectangular_boxes() {
+    fn draw_board_renders_large_circular_stones() {
         use crate::ui::tui::theme::ColorSupport;
         let theme = Theme::new(ColorSupport::TrueColor);
-        for &(size, w, h) in &[(9u8, 80u16, 40u16), (13, 90, 42), (19, 100, 42)] {
+        for &(size, w, h) in &[(9u8, 80u16, 40u16), (13, 90, 42), (19, 100, 44)] {
             let mut g = GameView::empty(1, size);
             g.game.play(Coord::new(2, 2)).unwrap();
             g.game.play(Coord::new(3, 2)).unwrap();
@@ -612,12 +756,12 @@ mod tests {
             draw_board(&mut buf, area, &g, &theme, true);
             let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(
-                rendered.contains('●') && rendered.contains('◉'),
-                "pure circular glyphs expected on {size}x{size}"
+                rendered.contains('█') && rendered.contains('▄') && rendered.contains('▀'),
+                "large circular disc blocks expected on {size}x{size}"
             );
             assert!(
-                !rendered.contains('▄') && !rendered.contains('▀') && !rendered.contains('█') && !rendered.contains('╭'),
-                "no multi-line block art must be used on {size}x{size}"
+                !rendered.contains('╭') && !rendered.contains('╰'),
+                "no hollow rectangular box borders must be used on {size}x{size}"
             );
         }
     }

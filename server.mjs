@@ -1298,13 +1298,13 @@ const HTML_PAGE = `<!DOCTYPE html>
 
     function buildLineGridBoardSvg(size, grid, lastMove, koPoint, est, toPlay) {
       const V = 1000;
-      const pad = size === 19 ? 46 : size === 13 ? 56 : 66;
+      const pad = size === 19 ? 52 : size === 13 ? 68 : 92;
       const span = V - pad * 2;
       const step = size > 1 ? span / (size - 1) : span;
       // Scale stone radius proportionally with grid step (no fixed pixel cap) so stones always match board scale
-      const stoneR = step * 0.475;
+      const stoneR = step * 0.48;
       const crossArm = Math.max(7, step * 0.18);
-      const fontSize = size === 19 ? 20 : size === 13 ? 24 : 28;
+      const fontSize = size === 19 ? 20 : size === 13 ? 23 : 26;
 
       let svg = \`<svg class="board-svg" viewBox="0 0 \${V} \${V}" xmlns="http://www.w3.org/2000/svg">\`;
       svg += \`<defs>
@@ -1322,21 +1322,23 @@ const HTML_PAGE = `<!DOCTYPE html>
       // Subtle board surface & outer line frame (外边线条框绘制)
       svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="8" fill="#0f141c" />\`;
       // Outer line box frame enclosing board and coordinates
-      svg += \`<rect x="10" y="10" width="\${V - 20}" height="\${V - 20}" rx="6" fill="none" stroke="#58a6ff" stroke-width="2.6" />\`;
-      svg += \`<rect x="16" y="16" width="\${V - 32}" height="\${V - 32}" rx="4" fill="none" stroke="#21262d" stroke-width="1.2" />\`;
+      svg += \`<rect x="8" y="8" width="\${V - 16}" height="\${V - 16}" rx="6" fill="none" stroke="#58a6ff" stroke-width="2.6" />\`;
+      svg += \`<rect x="14" y="14" width="\${V - 28}" height="\${V - 28}" rx="4" fill="none" stroke="#21262d" stroke-width="1.2" />\`;
 
       // Coordinate labels (Top, Bottom, Left, Right)
+      const labelPos = (pad * 0.30).toFixed(2);
+      const labelEnd = (V - pad * 0.30).toFixed(2);
       for (let c = 0; c < size; c++) {
         const x = (pad + c * step).toFixed(2);
         const lbl = COLS[c];
-        svg += \`<text x="\${x}" y="\${(pad * 0.42).toFixed(2)}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
-        svg += \`<text x="\${x}" y="\${(V - pad * 0.42).toFixed(2)}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
+        svg += \`<text x="\${x}" y="\${labelPos}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
+        svg += \`<text x="\${x}" y="\${labelEnd}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${lbl}</text>\`;
       }
       for (let r = 1; r <= size; r++) {
         const rIdx = size - r;
         const y = (pad + rIdx * step).toFixed(2);
-        svg += \`<text x="\${(pad * 0.40).toFixed(2)}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
-        svg += \`<text x="\${(V - pad * 0.40).toFixed(2)}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${labelPos}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${labelEnd}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
       }
 
       // Square Grid Lines (Horizontal & Vertical lines) and outer perimeter line frame
