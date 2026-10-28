@@ -537,30 +537,28 @@ pub fn draw_board(
                         .add_modifier(Modifier::DIM);
                     if m.stone_rx == 3 && m.stone_ry == 1 {
                         if y > min_draw_y {
-                            buffer.set_string(x - 2, y - 1, "╭───╮", style);
+                            buffer.set_string(x - 2, y - 1, "▄▄▄▄▄", style);
                         }
-                        buffer.set_string(x - 3, y, "(  ╳  )", style);
+                        buffer.set_string(x - 3, y, "██ ╳ ██", style);
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 2, y + 1, "╰───╯", style);
+                            buffer.set_string(x - 2, y + 1, "▀▀▀▀▀", style);
                         }
                     } else if m.stone_rx == 2 && m.stone_ry == 1 {
                         if y > min_draw_y {
-                            buffer.set_string(x - 1, y - 1, "╭─╮", style);
+                            buffer.set_string(x - 1, y - 1, "▄▄▄", style);
                         }
-                        buffer.set_string(x - 2, y, "( ╳ )", style);
+                        buffer.set_string(x - 2, y, "█ ╳ █", style);
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 1, y + 1, "╰─╯", style);
+                            buffer.set_string(x - 1, y + 1, "▀▀▀", style);
                         }
                     } else if m.stone_rx == 1 && m.stone_ry == 1 {
                         if y > min_draw_y {
-                            buffer.set_string(x - 1, y - 1, "╭─╮", style);
+                            buffer.set_string(x, y - 1, "▄", style);
                         }
-                        buffer.set_string(x - 1, y, "(╳)", style);
+                        buffer.set_string(x - 1, y, "█╳█", style);
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 1, y + 1, "╰─╯", style);
+                            buffer.set_string(x, y + 1, "▀", style);
                         }
-                    } else if m.stone_rx >= 1 {
-                        buffer.set_string(x - 1, y, "(╳)", style);
                     } else {
                         buffer.set_string(x, y, "╳", style);
                     }
@@ -570,8 +568,9 @@ pub fn draw_board(
                         Color::Black => theme.stone_black,
                         Color::White => theme.stone_white,
                     };
-                    let border_style = Style::default()
-                        .fg(if is_last { theme.last_move } else { base_fg })
+                    let ring_color = if is_last { theme.last_move } else { base_fg };
+                    let ring_style = Style::default()
+                        .fg(ring_color)
                         .add_modifier(Modifier::BOLD);
                     let body_style = Style::default()
                         .fg(base_fg)
@@ -580,80 +579,145 @@ pub fn draw_board(
                         .fg(theme.last_move)
                         .add_modifier(Modifier::BOLD);
 
-                    let neighbor_up = row_index > 0
+                    // Check if there is a stone immediately above when row_step == 2 so the shared
+                    // row (y - 1) can display BOTH the upper stone's bottom cap (▀, fg) and this
+                    // stone's top cap (▄, bg) in a single half-block cell without collision.
+                    let up_stone_color: Option<ratatui::style::Color> = if row_index > 0
                         && m.row_step == 2
-                        && has_visual_stone(col, row_index - 1);
-                    let neighbor_down = row_index + 1 < size
-                        && m.row_step == 2
-                        && has_visual_stone(col, row_index + 1);
+                        && has_visual_stone(col, row_index - 1)
+                    {
+                        let r_up = u16::from(size) - u16::from(row_index - 1);
+                        let up_c = if game.estimate_active {
+                            match overlay
+                                .get((row_index - 1) as usize)
+                                .and_then(|line| line.get(col as usize))
+                                .copied()
+                            {
+                                Some(PointEstimate::LiveStone(c)) => Some(c),
+                                _ => None,
+                            }
+                        } else {
+                            game.board().get(col, r_up)
+                        };
+                        let up_is_last = last_move
+                            .map(|coord| coord.col == col && coord.row == r_up)
+                            .unwrap_or(false);
+                        up_c.map(|c| {
+                            if up_is_last {
+                                theme.last_move
+                            } else {
+                                match c {
+                                    Color::Black => theme.stone_black,
+                                    Color::White => theme.stone_white,
+                                }
+                            }
+                        })
+                    } else {
+                        None
+                    };
 
                     if m.stone_rx == 3 && m.stone_ry == 1 {
-                        // 7x3 Extra-Large Circular Stone (tapered 5-char top/bottom arcs + 7-char curved equator)
+                        // 7x3 Extra-Large Pixel Circle (5-wide half-block caps ▄▄▄▄▄ / ▀▀▀▀▀ + 7-wide equator)
                         if y >= min_draw_y + 1 {
-                            buffer.set_string(x - 2, y - 1, "╭───╮", border_style);
+                            buffer.set_string(x - 2, y - 1, "▄▄▄▄▄", ring_style);
                         }
                         let mid_str = match color {
-                            Color::Black => "( ●●● )",
-                            Color::White => "(  ○  )",
+                            Color::Black => "███████",
+                            Color::White => "██   ██",
                         };
-                        buffer.set_string(x - 3, y, mid_str, body_style);
+                        buffer.set_string(x - 3, y, mid_str, ring_style);
                         if is_last {
-                            buffer.set_string(x - 3, y, "(", border_style);
-                            buffer.set_string(x + 3, y, ")", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
+                            let center_st = match color {
+                                Color::Black => Style::default()
+                                    .fg(
+                                        if theme.support
+                                            == crate::ui::tui::theme::ColorSupport::TrueColor
+                                        {
+                                            ratatui::style::Color::Rgb(15, 20, 28)
+                                        } else {
+                                            ratatui::style::Color::Black
+                                        },
+                                    )
+                                    .bg(theme.last_move)
+                                    .add_modifier(Modifier::BOLD),
+                                Color::White => last_center_style,
+                            };
+                            buffer.set_string(x, y, "◉", center_st);
                         }
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 2, y + 1, "╰───╯", border_style);
+                            buffer.set_string(x - 2, y + 1, "▀▀▀▀▀", ring_style);
                         }
                     } else if m.stone_rx == 2 && m.stone_ry == 1 {
-                        // 5x3 Large Circular Stone (tapered 3-char top/bottom arcs + 5-char curved equator)
+                        // 5x3 Large Pixel Circle (3-wide half-block caps ▄▄▄ / ▀▀▀ + 5-wide equator)
                         if y >= min_draw_y + 1 {
-                            buffer.set_string(x - 1, y - 1, "╭─╮", border_style);
+                            buffer.set_string(x - 1, y - 1, "▄▄▄", ring_style);
                         }
                         let mid_str = match color {
-                            Color::Black => "(●●●)",
-                            Color::White => "( ○ )",
+                            Color::Black => "█████",
+                            Color::White => "█   █",
                         };
-                        buffer.set_string(x - 2, y, mid_str, body_style);
+                        buffer.set_string(x - 2, y, mid_str, ring_style);
                         if is_last {
-                            buffer.set_string(x - 2, y, "(", border_style);
-                            buffer.set_string(x + 2, y, ")", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
+                            let center_st = match color {
+                                Color::Black => Style::default()
+                                    .fg(
+                                        if theme.support
+                                            == crate::ui::tui::theme::ColorSupport::TrueColor
+                                        {
+                                            ratatui::style::Color::Rgb(15, 20, 28)
+                                        } else {
+                                            ratatui::style::Color::Black
+                                        },
+                                    )
+                                    .bg(theme.last_move)
+                                    .add_modifier(Modifier::BOLD),
+                                Color::White => last_center_style,
+                            };
+                            buffer.set_string(x, y, "◉", center_st);
                         }
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 1, y + 1, "╰─╯", border_style);
+                            buffer.set_string(x - 1, y + 1, "▀▀▀", ring_style);
                         }
                     } else if m.stone_rx == 1 && m.stone_ry == 1 {
-                        // 3x3 Medium Circular Stone (for row_step == 2, col_step == 4)
+                        // 3x3 Medium Pixel Circle (for 19x19 / 13x13 at col_step=4, row_step=2)
+                        // Uses half-blocks ▄ (bottom half of y-1) and ▀ (top half of y+1) so height is 4 square sub-pixels
                         if y >= min_draw_y + 1 {
-                            let top_str = if neighbor_up { " ─ " } else { "╭─╮" };
-                            buffer.set_string(x - 1, y - 1, top_str, border_style);
+                            if let Some(up_fg) = up_stone_color {
+                                // Combine upper stone's bottom cap (▀ in fg) + this stone's top cap (bg)
+                                let combined_style = Style::default()
+                                    .fg(up_fg)
+                                    .bg(ring_color)
+                                    .add_modifier(Modifier::BOLD);
+                                buffer.set_string(x, y - 1, "▀", combined_style);
+                            } else {
+                                buffer.set_string(x, y - 1, "▄", ring_style);
+                            }
                         }
                         let mid_str = match color {
-                            Color::Black => "(●)",
-                            Color::White => "(○)",
+                            Color::Black => "███",
+                            Color::White => "█ █",
                         };
-                        buffer.set_string(x - 1, y, mid_str, body_style);
+                        buffer.set_string(x - 1, y, mid_str, ring_style);
                         if is_last {
-                            buffer.set_string(x - 1, y, "(", border_style);
-                            buffer.set_string(x + 1, y, ")", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
+                            let center_st = match color {
+                                Color::Black => Style::default()
+                                    .fg(
+                                        if theme.support
+                                            == crate::ui::tui::theme::ColorSupport::TrueColor
+                                        {
+                                            ratatui::style::Color::Rgb(15, 20, 28)
+                                        } else {
+                                            ratatui::style::Color::Black
+                                        },
+                                    )
+                                    .bg(theme.last_move)
+                                    .add_modifier(Modifier::BOLD),
+                                Color::White => last_center_style,
+                            };
+                            buffer.set_string(x, y, "◉", center_st);
                         }
                         if y + 1 < max_draw_y {
-                            let bot_str = if neighbor_down { " ─ " } else { "╰─╯" };
-                            buffer.set_string(x - 1, y + 1, bot_str, border_style);
-                        }
-                    } else if m.stone_rx >= 1 {
-                        // 3x1 Round Stone
-                        let glyph = match color {
-                            Color::Black => "(●)",
-                            Color::White => "(○)",
-                        };
-                        buffer.set_string(x - 1, y, glyph, body_style);
-                        if is_last {
-                            buffer.set_string(x - 1, y, "(", border_style);
-                            buffer.set_string(x + 1, y, ")", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
+                            buffer.set_string(x, y + 1, "▀", ring_style);
                         }
                     } else {
                         // 1x1 Compact Circular Stone
@@ -786,12 +850,12 @@ mod tests {
             draw_board(&mut buf, area, &g, &theme, true);
             let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
             assert!(
-                rendered.contains('●') || rendered.contains('◉'),
-                "circular black/last-move glyph expected on {size}x{size}"
+                rendered.contains('▄') && rendered.contains('▀') && rendered.contains('◉'),
+                "pixel-circle half-blocks and last-move center expected on {size}x{size}"
             );
             assert!(
-                !rendered.contains('█'),
-                "rectangular full-block '█' must not be used for stones on {size}x{size}"
+                !rendered.contains('╭') && !rendered.contains('╰'),
+                "wireframe box corners '╭'/'╰' must not be used for stones on {size}x{size}"
             );
         }
     }
