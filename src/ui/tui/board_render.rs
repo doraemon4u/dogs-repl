@@ -153,18 +153,20 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
 }
 
 /// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
-/// Because terminal cells have a 1:2 width-to-height ratio, `rx == ry * 2` makes stones visually square/circular.
+/// Keeps `stone_width == col_step - 1` (`rx = 1` at `col_step = 4`, `rx = 2` at `col_step = 6`,
+/// `rx = 3` at `col_step = 8`) so circular stones never overlap horizontally and always leave
+/// a visible grid connection `─` between adjacent intersections.
 pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
     let rx = if col_step >= 8 && row_step >= 4 {
         3
-    } else if col_step >= 4 && row_step >= 2 {
+    } else if col_step >= 6 && row_step >= 3 {
         2
-    } else if col_step >= 3 && row_step >= 2 {
+    } else if col_step >= 4 && row_step >= 2 {
         1
     } else {
         0
     };
-    let ry = if row_step >= 2 && col_step >= 3 {
+    let ry = if row_step >= 2 && col_step >= 4 {
         1
     } else {
         0
@@ -535,30 +537,28 @@ pub fn draw_board(
                         .add_modifier(Modifier::DIM);
                     if m.stone_rx == 3 && m.stone_ry == 1 {
                         if y > min_draw_y {
-                            buffer.set_string(x - 3, y - 1, "╭─────╮", style);
+                            buffer.set_string(x - 2, y - 1, "╭───╮", style);
                         }
-                        buffer.set_string(x - 3, y, "│  ╳  │", style);
+                        buffer.set_string(x - 3, y, "(  ╳  )", style);
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 3, y + 1, "╰─────╯", style);
+                            buffer.set_string(x - 2, y + 1, "╰───╯", style);
                         }
                     } else if m.stone_rx == 2 && m.stone_ry == 1 {
                         if y > min_draw_y {
-                            buffer.set_string(x - 2, y - 1, "╭───╮", style);
+                            buffer.set_string(x - 1, y - 1, "╭─╮", style);
                         }
-                        buffer.set_string(x - 2, y, "│ ╳ │", style);
+                        buffer.set_string(x - 2, y, "( ╳ )", style);
                         if y + 1 < max_draw_y {
-                            buffer.set_string(x - 2, y + 1, "╰───╯", style);
+                            buffer.set_string(x - 1, y + 1, "╰─╯", style);
                         }
                     } else if m.stone_rx == 1 && m.stone_ry == 1 {
                         if y > min_draw_y {
                             buffer.set_string(x - 1, y - 1, "╭─╮", style);
                         }
-                        buffer.set_string(x - 1, y, "│╳│", style);
+                        buffer.set_string(x - 1, y, "(╳)", style);
                         if y + 1 < max_draw_y {
                             buffer.set_string(x - 1, y + 1, "╰─╯", style);
                         }
-                    } else if m.stone_rx >= 2 {
-                        buffer.set_string(x - 2, y, "( ╳ )", style);
                     } else if m.stone_rx >= 1 {
                         buffer.set_string(x - 1, y, "(╳)", style);
                     } else {
@@ -586,96 +586,67 @@ pub fn draw_board(
                     let neighbor_down = row_index + 1 < size
                         && m.row_step == 2
                         && has_visual_stone(col, row_index + 1);
-                    let neighbor_left = col > 0
-                        && m.col_step == m.stone_rx * 2
-                        && has_visual_stone(col - 1, row_index);
 
                     if m.stone_rx == 3 && m.stone_ry == 1 {
-                        // 7x3 Extra-Large Stone
+                        // 7x3 Extra-Large Circular Stone (tapered 5-char top/bottom arcs + 7-char curved equator)
                         if y >= min_draw_y + 1 {
-                            let top_str = if neighbor_up { "├─────┤" } else { "╭─────╮" };
-                            buffer.set_string(x - 3, y - 1, top_str, border_style);
+                            buffer.set_string(x - 2, y - 1, "╭───╮", border_style);
                         }
                         let mid_str = match color {
-                            Color::Black => "│█████│",
-                            Color::White => "│  ○  │",
+                            Color::Black => "( ●●● )",
+                            Color::White => "(  ○  )",
                         };
                         buffer.set_string(x - 3, y, mid_str, body_style);
                         if is_last {
-                            buffer.set_string(x - 3, y, "│", border_style);
-                            buffer.set_string(x + 3, y, "│", border_style);
+                            buffer.set_string(x - 3, y, "(", border_style);
+                            buffer.set_string(x + 3, y, ")", border_style);
                             buffer.set_string(x, y, "◉", last_center_style);
                         }
                         if y + 1 < max_draw_y {
-                            let bot_str = if neighbor_down { "├─────┤" } else { "╰─────╯" };
-                            buffer.set_string(x - 3, y + 1, bot_str, border_style);
+                            buffer.set_string(x - 2, y + 1, "╰───╯", border_style);
                         }
                     } else if m.stone_rx == 2 && m.stone_ry == 1 {
-                        // 5x3 Large Stone (rx=2, ry=1 -> exact 1:1 visual square/circle)
+                        // 5x3 Large Circular Stone (tapered 3-char top/bottom arcs + 5-char curved equator)
                         if y >= min_draw_y + 1 {
-                            let top_str = match (neighbor_left, neighbor_up) {
-                                (true, true) => "┼───┤",
-                                (true, false) => "┬───╮",
-                                (false, true) => "├───┤",
-                                (false, false) => "╭───╮",
-                            };
-                            buffer.set_string(x - 2, y - 1, top_str, border_style);
+                            buffer.set_string(x - 1, y - 1, "╭─╮", border_style);
                         }
                         let mid_str = match color {
-                            Color::Black => "│███│",
-                            Color::White => "│ ○ │",
-                        };
-                        buffer.set_string(x - 2, y, mid_str, body_style);
-                        if is_last {
-                            buffer.set_string(x - 2, y, "│", border_style);
-                            buffer.set_string(x + 2, y, "│", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
-                        }
-                        if y + 1 < max_draw_y {
-                            let bot_str = match (neighbor_left, neighbor_down) {
-                                (true, true) => "┼───┤",
-                                (true, false) => "┴───╯",
-                                (false, true) => "├───┤",
-                                (false, false) => "╰───╯",
-                            };
-                            buffer.set_string(x - 2, y + 1, bot_str, border_style);
-                        }
-                    } else if m.stone_rx == 1 && m.stone_ry == 1 {
-                        // 3x3 Medium Stone
-                        if y >= min_draw_y + 1 {
-                            let top_str = if neighbor_up { "├─┤" } else { "╭─╮" };
-                            buffer.set_string(x - 1, y - 1, top_str, border_style);
-                        }
-                        let mid_str = match color {
-                            Color::Black => "│█│",
-                            Color::White => "│○│",
-                        };
-                        buffer.set_string(x - 1, y, mid_str, body_style);
-                        if is_last {
-                            buffer.set_string(x - 1, y, "│", border_style);
-                            buffer.set_string(x + 1, y, "│", border_style);
-                            buffer.set_string(x, y, "◉", last_center_style);
-                        }
-                        if y + 1 < max_draw_y {
-                            let bot_str = if neighbor_down { "├─┤" } else { "╰─╯" };
-                            buffer.set_string(x - 1, y + 1, bot_str, border_style);
-                        }
-                    } else if m.stone_rx >= 2 {
-                        // 5x1 Wide Stone (e.g. 19x19 in wide, standard-height terminals)
-                        let glyph = match color {
-                            Color::Black => "(███)",
+                            Color::Black => "(●●●)",
                             Color::White => "( ○ )",
                         };
-                        buffer.set_string(x - 2, y, glyph, body_style);
+                        buffer.set_string(x - 2, y, mid_str, body_style);
                         if is_last {
                             buffer.set_string(x - 2, y, "(", border_style);
                             buffer.set_string(x + 2, y, ")", border_style);
                             buffer.set_string(x, y, "◉", last_center_style);
                         }
+                        if y + 1 < max_draw_y {
+                            buffer.set_string(x - 1, y + 1, "╰─╯", border_style);
+                        }
+                    } else if m.stone_rx == 1 && m.stone_ry == 1 {
+                        // 3x3 Medium Circular Stone (for row_step == 2, col_step == 4)
+                        if y >= min_draw_y + 1 {
+                            let top_str = if neighbor_up { " ─ " } else { "╭─╮" };
+                            buffer.set_string(x - 1, y - 1, top_str, border_style);
+                        }
+                        let mid_str = match color {
+                            Color::Black => "(●)",
+                            Color::White => "(○)",
+                        };
+                        buffer.set_string(x - 1, y, mid_str, body_style);
+                        if is_last {
+                            buffer.set_string(x - 1, y, "(", border_style);
+                            buffer.set_string(x + 1, y, ")", border_style);
+                            buffer.set_string(x, y, "◉", last_center_style);
+                        }
+                        if y + 1 < max_draw_y {
+                            let bot_str = if neighbor_down { " ─ " } else { "╰─╯" };
+                            buffer.set_string(x - 1, y + 1, bot_str, border_style);
+                        }
                     } else if m.stone_rx >= 1 {
-                        // 3x1 Wide Stone (e.g. 19x19 in standard-height terminals)
+                        // 3x1 Round Stone
                         let glyph = match color {
-                            Color::Black => "(█)",
+                            Color::Black => "(●)",
                             Color::White => "(○)",
                         };
                         buffer.set_string(x - 1, y, glyph, body_style);
@@ -685,7 +656,7 @@ pub fn draw_board(
                             buffer.set_string(x, y, "◉", last_center_style);
                         }
                     } else {
-                        // 1x1 Compact Stone
+                        // 1x1 Compact Circular Stone
                         let glyph = match color {
                             Color::Black => "●",
                             Color::White => "○",
@@ -799,6 +770,29 @@ mod tests {
                     assert_eq!(m.grid_w, m.grid_h * 2);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn draw_board_renders_circular_stones_not_rectangular_boxes() {
+        use crate::ui::tui::theme::ColorSupport;
+        let theme = Theme::new(ColorSupport::TrueColor);
+        for &(size, w, h) in &[(9u8, 80u16, 40u16), (13, 90, 42), (19, 100, 42)] {
+            let mut g = GameView::empty(1, size);
+            g.game.play(Coord::new(2, 2)).unwrap();
+            g.game.play(Coord::new(3, 2)).unwrap();
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            draw_board(&mut buf, area, &g, &theme, true);
+            let rendered: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                rendered.contains('●') || rendered.contains('◉'),
+                "circular black/last-move glyph expected on {size}x{size}"
+            );
+            assert!(
+                !rendered.contains('█'),
+                "rectangular full-block '█' must not be used for stones on {size}x{size}"
+            );
         }
     }
 }
