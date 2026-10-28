@@ -174,6 +174,18 @@ impl Inner {
 
     /// `[command, data, rid]` — the server answers with the same rid.
     fn request(&self, command: &str, data: Value) {
+        // OGS channel subscriptions and events (such as `chat/join`, `chat/part`, `chat/send`)
+        // are fire-and-forget push notifications without an RPC callback acknowledgment.
+        // Enqueueing them as RPC requests causes an inevitable 30-second timeout error.
+        if command == "chat/join"
+            || command == "chat/part"
+            || command == "chat/send"
+            || command == "game/disconnect"
+        {
+            self.notify(command, data);
+            return;
+        }
+
         let rid = self.next_rid.fetch_add(1, Ordering::Relaxed);
         self.pending
             .lock()
@@ -369,7 +381,7 @@ impl Inner {
                     text,
                 }
             }
-            "chat-join" => {
+            "chat-join" | "chat/join" | "channel-join" | "channel/join" => {
                 let raw_channel = data
                     .get("channel")
                     .and_then(Value::as_str)
@@ -407,7 +419,7 @@ impl Inner {
                     history,
                 }
             }
-            "chat-history" | "channel-history" | "chat/history" => {
+            "chat-history" | "channel-history" | "chat/history" | "channel/history" => {
                 let raw_channel = data
                     .get("channel")
                     .and_then(Value::as_str)
@@ -794,13 +806,13 @@ impl RealtimeClient {
     }
 
     /// `chat/join` — subscribes to a world chat channel and requests channel history.
+    /// In the OGS realtime protocol, channel subscriptions are fire-and-forget notifications (`notify`),
+    /// not RPC requests with an ACK callback ID.
     pub fn chat_join(&self, channel: &str) {
         let wire = crate::session::store::to_ogs_wire_channel(channel);
-        self.inner.request("chat/join", json!({ "channel": wire }));
         self.inner.notify("chat/join", json!({ "channel": wire }));
         let raw = channel.trim().trim_start_matches('#');
         if !raw.is_empty() && raw != wire {
-            self.inner.request("chat/join", json!({ "channel": raw }));
             self.inner.notify("chat/join", json!({ "channel": raw }));
         }
     }

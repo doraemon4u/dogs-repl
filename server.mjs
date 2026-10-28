@@ -1137,11 +1137,11 @@ const HTML_PAGE = `<!DOCTYPE html>
           \`频道列表已打开（点击频道即可进入，或输入 'channels <名>' / 'join <名>' 进入）：\${joinedList || 'none'} | 全部: \${state.availableChannels.map(c => '#' + c).join(', ')}\`,
           false
         );
-      } else if (kw === 'join' || kw === 'world') {
+      } else if (kw === 'join' || kw === '/join' || kw === 'world') {
         const ch = (parts[1] || 'en').replace(/^#/, '');
         enterWorldChannel(ch);
         return;
-      } else if (kw === 'part' || kw === 'leave') {
+      } else if (kw === 'part' || kw === '/part' || kw === 'leave' || kw === '/leave') {
         const ch = (parts[1] || state.worldChannel).replace(/^#/, '');
         leaveWorldChannel(ch);
         return;
@@ -1151,7 +1151,15 @@ const HTML_PAGE = `<!DOCTYPE html>
       } else if (kw === 'chat' || kw === 'say') {
         const text = line.slice(parts[0].length).trim();
         if (!text) {
-          pushLog('warn', 'usage: chat <message>');
+          pushLog('warn', 'usage: chat <message> | chat /join <channel>');
+        } else if (text.startsWith('/join')) {
+          const sub = text.split(/\\s+/)[1] || 'en';
+          enterWorldChannel(sub.replace(/^#/, ''));
+          return;
+        } else if (text.startsWith('/part') || text.startsWith('/leave')) {
+          const sub = text.split(/\\s+/)[1] || state.worldChannel;
+          leaveWorldChannel(sub.replace(/^#/, ''));
+          return;
         } else {
           const ch = state.chatScope === 'game' ? 'game/' + state.gameId : state.worldChannel;
           ensureChannel(ch);
@@ -1161,7 +1169,16 @@ const HTML_PAGE = `<!DOCTYPE html>
       } else if (kw === 'help' || kw === '?') {
         pushLog('ok', 'Commands: [a10] | play D4 | size 9|13|19 | pass | preset ko | estimate [auto|confirm|exit] | step [prev|next|first|last|<n>] | channels [<ch>] | join <ch> | part <ch> | world <ch> | chat <msg>');
       } else if (state.focus === 'chat' || state.chatScope === 'world') {
-        // When focused on chat or inside a world channel, plain text sends a chat message directly
+        // When focused on chat or inside a world channel, handle /join or send chat message directly
+        if (line.startsWith('/join')) {
+          const sub = line.split(/\\s+/)[1] || 'en';
+          enterWorldChannel(sub.replace(/^#/, ''));
+          return;
+        } else if (line.startsWith('/part') || line.startsWith('/leave')) {
+          const sub = line.split(/\\s+/)[1] || state.worldChannel;
+          leaveWorldChannel(sub.replace(/^#/, ''));
+          return;
+        }
         const ch = state.chatScope === 'game' ? 'game/' + state.gameId : state.worldChannel;
         ensureChannel(ch);
         state.channels[ch].messages.push({ kind: 'chat', author: 'you', text: line });

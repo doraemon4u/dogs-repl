@@ -221,9 +221,22 @@ pub fn parse(input: &str) -> UserCommand {
         "resign" => UserCommand::Resign,
         "undo" => parse_undo(&parts),
         "chat" | "say" => match rest_after(input, parts[0]) {
-            Some(text) if !text.is_empty() => UserCommand::Chat(text.to_string()),
+            Some(text) if !text.is_empty() => {
+                let trimmed = text.trim();
+                if trimmed.starts_with("/join") {
+                    let subparts: Vec<&str> = trimmed.split_whitespace().collect();
+                    parse_channel(subparts.get(1), "join")
+                } else if trimmed.starts_with("/part") || trimmed.starts_with("/leave") {
+                    let subparts: Vec<&str> = trimmed.split_whitespace().collect();
+                    parse_channel(subparts.get(1), "part")
+                } else {
+                    UserCommand::Chat(text.to_string())
+                }
+            }
             _ => UserCommand::Invalid("usage: chat <message>".into()),
         },
+        "/join" => parse_channel(parts.get(1), "join"),
+        "/part" | "/leave" => parse_channel(parts.get(1), "part"),
         "join" | "channel" => parse_channel(parts.get(1), keyword.as_str()),
         "part" | "leavechannel" => parse_channel(parts.get(1), "part"),
         "channels" => match parts.get(1) {
