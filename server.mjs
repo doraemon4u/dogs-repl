@@ -170,6 +170,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       overflow: hidden;
     }
     .board-grid {
+      container-type: size;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -180,9 +181,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       user-select: none;
     }
     .board-square-wrap {
-      width: min(100%, calc(100vh - 155px));
-      max-width: 100%;
-      max-height: 100%;
+      width: min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
       aspect-ratio: 1 / 1;
       display: flex;
       align-items: center;
@@ -191,6 +191,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       border: 1px solid #262c36;
       border-radius: 4px;
       padding: 4px;
+      flex-shrink: 0;
     }
     .board-svg {
       width: 100%;

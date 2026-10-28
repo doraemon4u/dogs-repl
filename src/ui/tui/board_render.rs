@@ -153,12 +153,13 @@ fn intersection(size: u8, col: u8, row_index: u8) -> char {
 }
 
 /// Returns the stone horizontal and vertical half-radii `(rx, ry)` for a given `(col_step, row_step)`.
+/// Because terminal cells have a 1:2 width-to-height ratio, `rx == ry * 2` makes stones visually square/circular.
 pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
-    let rx = if col_step >= 7 && row_step >= 2 {
+    let rx = if col_step >= 8 && row_step >= 4 {
         3
-    } else if col_step >= 5 {
+    } else if col_step >= 4 && row_step >= 2 {
         2
-    } else if col_step >= 3 {
+    } else if col_step >= 3 && row_step >= 2 {
         1
     } else {
         0
@@ -171,59 +172,34 @@ pub fn stone_radii(col_step: u16, row_step: u16) -> (u16, u16) {
     (rx, ry)
 }
 
-/// Computes optimal `(col_step, row_step)` so 9x9, 13x13, and 19x19 boards all expand
-/// to fill the 2/3 board pane and render proportional multi-character stones.
+/// Computes optimal `(col_step, row_step)` enforcing a strict 2:1 character aspect ratio
+/// (`col_step == row_step * 2`) so 9x9, 13x13, and 19x19 boards are ALWAYS rendered as a
+/// true 1:1 geometric square (正四边形) in terminal character cells, never a rectangle.
 pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     if size <= 1 {
         return (2, 1);
     }
     let gaps = u16::from(size - 1);
 
-    // Find maximum horizontal step that fits `area.width`
-    let mut max_col = 2u16;
-    for c in 2..=12 {
-        let rx = if c >= 7 { 3 } else if c >= 5 { 2 } else if c >= 3 { 1 } else { 0 };
-        let needed_w = LABEL_WIDTH + rx + gaps * c + rx + 1;
-        if needed_w <= area.width {
-            max_col = c;
-        } else {
-            break;
-        }
-    }
-
-    // Find maximum vertical step that fits `area.height`
-    let mut max_row = 1u16;
+    let mut best_row_step = 1u16;
     for r in 1..=6 {
+        let c = r * 2;
+        let (rx, ry) = stone_radii(c, r);
+        let needed_w = LABEL_WIDTH + rx + gaps * c + rx + 1;
         let needed_h = if r >= 3 {
-            gaps * r + 4
-        } else if r == 2 {
-            // Allow 19x19 (gaps=18 -> 36+1=37) to enter 2D stone mode in standard full-screen terminals
-            gaps * r + 1
+            gaps * r + 1 + ry * 2
         } else {
-            gaps * r + 2
+            // Allow 19x19 (gaps=18 -> 36+1=37) to enter r=2, c=4 square mode in standard full-screen terminals
+            gaps * r + 1
         };
-        let min_col_for_r = if r == 2 { 3 } else { r * 2 };
-        if needed_h <= area.height && max_col >= min_col_for_r {
-            max_row = r;
+        if needed_w <= area.width && needed_h <= area.height {
+            best_row_step = r;
         } else {
             break;
         }
     }
 
-    let row_step = max_row.max(1);
-    let col_step = if row_step == 1 {
-        // When vertical height limits row_step to 1 (e.g. 19x19 on shorter terminals),
-        // still expand horizontally up to 6 cols per step so 19x19 fills the pane and uses 3..5-col stones.
-        max_col.clamp(2, 6)
-    } else if row_step == 2 {
-        // For row_step == 2 (19x19 or 13x13), expand up to 6 cols per step so 5x3 stones can be used on wide screens
-        max_col.clamp(3, 6)
-    } else {
-        // For row_step >= 3 (9x9 or 13x13), keep ~2:1 aspect ratio
-        (row_step * 2 + 2).min(max_col).max(row_step * 2).min(max_col)
-    };
-
-    (col_step, row_step)
+    (best_row_step * 2, best_row_step)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -238,6 +214,8 @@ struct BoardMetrics {
     grid_y0: u16,
     grid_w: u16,
     grid_h: u16,
+    total_w: u16,
+    total_h: u16,
     show_top_coords: bool,
     show_bottom_coords: bool,
     show_right_coords: bool,
@@ -300,6 +278,8 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
         grid_y0,
         grid_w,
         grid_h,
+        total_w,
+        total_h,
         show_top_coords,
         show_bottom_coords,
         show_right_coords,
@@ -358,6 +338,32 @@ pub fn draw_board(
         theme.board
     });
     let grid_line_style = Style::default().fg(muted);
+
+    // Optional Pass 0: Draw a strict 1:1 visual square Goban outer border (`frame_w == 2 * frame_h`)
+    // around the centered square board when space permits inside the Board pane.
+    if m.origin_y > area.y && m.origin_y + m.total_h < area.y + area.height {
+        let frame_h = m.total_h + 2;
+        let ideal_frame_w = (frame_h * 2).max(m.total_w + 2);
+        if ideal_frame_w <= area.width {
+            let fx0 = area.x + area.width.saturating_sub(ideal_frame_w) / 2;
+            let fy0 = m.origin_y - 1;
+            let fx1 = fx0 + ideal_frame_w - 1;
+            let fy1 = fy0 + frame_h - 1;
+            let border_st = Style::default().fg(muted);
+            buffer.set_string(fx0, fy0, "┏", border_st);
+            buffer.set_string(fx1, fy0, "┓", border_st);
+            buffer.set_string(fx0, fy1, "┗", border_st);
+            buffer.set_string(fx1, fy1, "┛", border_st);
+            for cx in (fx0 + 1)..fx1 {
+                buffer.set_string(cx, fy0, "━", border_st);
+                buffer.set_string(cx, fy1, "━", border_st);
+            }
+            for cy in (fy0 + 1)..fy1 {
+                buffer.set_string(fx0, cy, "┃", border_st);
+                buffer.set_string(fx1, cy, "┃", border_st);
+            }
+        }
+    }
 
     // Pass 1: Coordinate labels & full board grid
     for col in 0..size {
@@ -580,6 +586,9 @@ pub fn draw_board(
                     let neighbor_down = row_index + 1 < size
                         && m.row_step == 2
                         && has_visual_stone(col, row_index + 1);
+                    let neighbor_left = col > 0
+                        && m.col_step == m.stone_rx * 2
+                        && has_visual_stone(col - 1, row_index);
 
                     if m.stone_rx == 3 && m.stone_ry == 1 {
                         // 7x3 Extra-Large Stone
@@ -602,9 +611,14 @@ pub fn draw_board(
                             buffer.set_string(x - 3, y + 1, bot_str, border_style);
                         }
                     } else if m.stone_rx == 2 && m.stone_ry == 1 {
-                        // 5x3 Large Stone
+                        // 5x3 Large Stone (rx=2, ry=1 -> exact 1:1 visual square/circle)
                         if y >= min_draw_y + 1 {
-                            let top_str = if neighbor_up { "├───┤" } else { "╭───╮" };
+                            let top_str = match (neighbor_left, neighbor_up) {
+                                (true, true) => "┼───┤",
+                                (true, false) => "┬───╮",
+                                (false, true) => "├───┤",
+                                (false, false) => "╭───╮",
+                            };
                             buffer.set_string(x - 2, y - 1, top_str, border_style);
                         }
                         let mid_str = match color {
@@ -618,7 +632,12 @@ pub fn draw_board(
                             buffer.set_string(x, y, "◉", last_center_style);
                         }
                         if y + 1 < max_draw_y {
-                            let bot_str = if neighbor_down { "├───┤" } else { "╰───╯" };
+                            let bot_str = match (neighbor_left, neighbor_down) {
+                                (true, true) => "┼───┤",
+                                (true, false) => "┴───╯",
+                                (false, true) => "├───┤",
+                                (false, false) => "╰───╯",
+                            };
                             buffer.set_string(x - 2, y + 1, bot_str, border_style);
                         }
                     } else if m.stone_rx == 1 && m.stone_ry == 1 {
@@ -753,6 +772,31 @@ mod tests {
                 for row in 1..=u16::from(size) {
                     let cell = text_cell(&board, size, col, row, None);
                     assert_eq!(cell.chars().count(), 2, "size {size} cell {col},{row}: {cell:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn board_steps_and_grid_are_strictly_square_across_all_sizes() {
+        for size in [9u8, 13, 19] {
+            for &(w, h) in &[
+                (60u16, 24u16),
+                (80, 30),
+                (100, 35),
+                (120, 42),
+                (160, 50),
+                (200, 32),
+            ] {
+                let area = Rect::new(0, 0, w, h);
+                let (col_step, row_step) = compute_board_steps(area, size);
+                assert_eq!(
+                    col_step,
+                    row_step * 2,
+                    "size {size} in {w}x{h} must have col_step == row_step * 2 (1:1 visual square)"
+                );
+                if let Some(m) = compute_metrics(area, size) {
+                    assert_eq!(m.grid_w, m.grid_h * 2);
                 }
             }
         }
