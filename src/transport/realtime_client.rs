@@ -83,6 +83,12 @@ pub enum RealtimeEvent {
     ChatJoin {
         channel: String,
         users: Vec<(i64, String)>,
+        history: Vec<Value>,
+    },
+    /// Channel chat history sync (`chat-history` / `chat/history`).
+    ChatHistory {
+        channel: String,
+        messages: Vec<Value>,
     },
     /// A user left a chat channel (`chat-part`).
     ChatPart {
@@ -280,7 +286,7 @@ impl Inner {
                 let command = self
                     .pending
                     .lock()
-                    .expect("pending map poisoned")
+                    .unwrap_or_else(|e| e.into_inner())
                     .remove(&rid)
                     .unwrap_or_else(|| format!("#{rid}"));
                 let data = values.get(1).cloned().unwrap_or(Value::Null);
@@ -340,7 +346,7 @@ impl Inner {
                     let mut seen = self
                         .seen_chat_ids
                         .lock()
-                        .expect("seen_chat_ids mutex poisoned");
+                        .unwrap_or_else(|e| e.into_inner());
                     if !seen.insert(msg_id) {
                         return;
                     }
@@ -387,7 +393,38 @@ impl Inner {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                RealtimeEvent::ChatJoin { channel, users }
+                let history = data
+                    .get("history")
+                    .or_else(|| data.get("messages"))
+                    .or_else(|| data.get("recent"))
+                    .or_else(|| data.get("chat"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                RealtimeEvent::ChatJoin {
+                    channel,
+                    users,
+                    history,
+                }
+            }
+            "chat-history" | "channel-history" | "chat/history" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or("en");
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let messages = if let Some(arr) = data.as_array() {
+                    arr.clone()
+                } else {
+                    data.get("messages")
+                        .or_else(|| data.get("history"))
+                        .or_else(|| data.get("lines"))
+                        .or_else(|| data.get("chat"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                RealtimeEvent::ChatHistory { channel, messages }
             }
             "chat-update-user" => {
                 let raw_channel = data
@@ -408,7 +445,11 @@ impl Inner {
                         (!name.is_empty()).then_some(vec![(id, name)])
                     })
                     .unwrap_or_default();
-                RealtimeEvent::ChatJoin { channel, users }
+                RealtimeEvent::ChatJoin {
+                    channel,
+                    users,
+                    history: Vec::new(),
+                }
             }
             "chat-part" => {
                 let raw_channel = data
@@ -480,9 +521,12 @@ impl Inner {
                     let mut seen = self
                         .seen_chat_ids
                         .lock()
-                        .expect("seen_chat_ids mutex poisoned");
+                        .unwrap_or_else(|e| e.into_inner());
                     if !seen.insert(msg_id) {
                         return;
+                    }
+                    if seen.len() > 4000 {
+                        seen.clear();
                     }
                 }
                 let author = crate::session::store::extract_chat_author(&data);
@@ -749,12 +793,14 @@ impl RealtimeClient {
         );
     }
 
-    /// `chat/join` — subscribes to a world chat channel (mapping short aliases like `"en"` to `"global-english"`).
+    /// `chat/join` — subscribes to a world chat channel and requests channel history.
     pub fn chat_join(&self, channel: &str) {
         let wire = crate::session::store::to_ogs_wire_channel(channel);
+        self.inner.request("chat/join", json!({ "channel": wire }));
         self.inner.notify("chat/join", json!({ "channel": wire }));
         let raw = channel.trim().trim_start_matches('#');
         if !raw.is_empty() && raw != wire {
+            self.inner.request("chat/join", json!({ "channel": raw }));
             self.inner.notify("chat/join", json!({ "channel": raw }));
         }
     }
@@ -1405,9 +1451,14 @@ mod tests {
             })]),
         );
         match events.try_recv().unwrap() {
-            RealtimeEvent::ChatJoin { channel, users } => {
+            RealtimeEvent::ChatJoin {
+                channel,
+                users,
+                history,
+            } => {
                 assert_eq!(channel, "en");
                 assert_eq!(users, vec![(1, "nomad".to_string())]);
+                assert!(history.is_empty());
             }
             other => panic!("unexpected: {other:?}"),
         }

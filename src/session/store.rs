@@ -893,6 +893,30 @@ impl Store {
         state.messages.len() < before
     }
 
+    /// Syncs historical chat lines into a channel (e.g. from `chat-join`, `chat-history`, or REST),
+    /// deduplicating messages already seen and not resetting unread counts.
+    pub fn apply_channel_history(&mut self, channel: &str, history: &[Value]) -> usize {
+        let canonical = canonical_channel_key(channel);
+        let key = if canonical.is_empty() {
+            channel.to_string()
+        } else {
+            canonical
+        };
+        let mut added = 0;
+        for item in history {
+            let author = extract_chat_author(item);
+            let Some(text) = extract_chat_text(item) else {
+                continue;
+            };
+            let msg_id = extract_chat_id(item);
+            let ts = extract_chat_timestamp(item);
+            if self.push_chat_meta(&key, &author, &text, msg_id, ts, false) {
+                added += 1;
+            }
+        }
+        added
+    }
+
     /// Syncs earlier game chat history from `gamedata.chat` or REST `/api/v1/games/:id`.
     pub fn apply_gamedata_chat(&mut self, game_id: u64, value: &Value) -> usize {
         let rows = value
@@ -2383,5 +2407,27 @@ mod tests {
         assert_eq!(store.channels["game/42"].messages.len(), 2);
         assert_eq!(store.channels["game/42"].messages[0].author, "alice");
         assert_eq!(store.channels["game/42"].messages[1].text, "have fun!");
+
+        let ch_synced = store.apply_channel_history(
+            "global-english",
+            &[
+                json!({ "uuid": "h1", "username": "carol", "message": "hello everyone!" }),
+                json!({ "uuid": "h2", "user": { "username": "dave" }, "text": "welcome to OGS" }),
+            ],
+        );
+        assert_eq!(ch_synced, 2);
+        assert_eq!(store.channels["en"].messages.len(), 2);
+        assert_eq!(store.channels["en"].messages[0].author, "carol");
+        assert_eq!(store.channels["en"].messages[0].text, "hello everyone!");
+        assert_eq!(store.channels["en"].messages[1].author, "dave");
+        assert_eq!(store.channels["en"].messages[1].text, "welcome to OGS");
+
+        // Replaying same history does not insert duplicates
+        let dup = store.apply_channel_history(
+            "en",
+            &[json!({ "uuid": "h1", "username": "carol", "message": "hello everyone!" })],
+        );
+        assert_eq!(dup, 0);
+        assert_eq!(store.channels["en"].messages.len(), 2);
     }
 }

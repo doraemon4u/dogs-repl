@@ -1395,17 +1395,50 @@ impl Actor {
                     .await;
                 self.state.write().await.push_chat(&channel, &author, &text);
             }
-            RealtimeEvent::ChatJoin { channel, users } => {
+            RealtimeEvent::ChatJoin {
+                channel,
+                users,
+                history,
+            } => {
                 self.event_bus
                     .publish(
                         "chat-join",
-                        &json!({"channel": channel, "count": users.len()}),
+                        &json!({"channel": channel, "count": users.len(), "history_count": history.len()}),
                     )
                     .await;
-                self.state
+                let mut state = self.state.write().await;
+                state.apply_channel_join(&channel, &users);
+                if !history.is_empty() {
+                    let synced = state.apply_channel_history(&channel, &history);
+                    if synced > 0 {
+                        drop(state);
+                        self.log(
+                            LogLevel::Info,
+                            format!("synced {synced} recent message(s) in #{channel}"),
+                        )
+                        .await;
+                    }
+                }
+            }
+            RealtimeEvent::ChatHistory { channel, messages } => {
+                self.event_bus
+                    .publish(
+                        "chat-history",
+                        &json!({"channel": channel, "count": messages.len()}),
+                    )
+                    .await;
+                let synced = self
+                    .state
                     .write()
                     .await
-                    .apply_channel_join(&channel, &users);
+                    .apply_channel_history(&channel, &messages);
+                if synced > 0 {
+                    self.log(
+                        LogLevel::Info,
+                        format!("synced {synced} history message(s) in #{channel}"),
+                    )
+                    .await;
+                }
             }
             RealtimeEvent::ChatPart {
                 channel,
@@ -1747,6 +1780,37 @@ impl Actor {
                     .or_else(|| data.as_u64());
                 if let Some(online) = online {
                     self.state.write().await.online = Some(online);
+                }
+            }
+            "chat/join" => {
+                let raw_channel = data
+                    .get("channel")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let channel = crate::session::store::canonical_channel_key(raw_channel);
+                let history = if let Some(arr) = data.as_array() {
+                    arr.clone()
+                } else {
+                    data.get("history")
+                        .or_else(|| data.get("messages"))
+                        .or_else(|| data.get("chat"))
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                };
+                if !history.is_empty() {
+                    let synced = self
+                        .state
+                        .write()
+                        .await
+                        .apply_channel_history(&channel, &history);
+                    if synced > 0 {
+                        self.log(
+                            LogLevel::Info,
+                            format!("synced {synced} channel history message(s) in #{channel}"),
+                        )
+                        .await;
+                    }
                 }
             }
             "hostinfo" => {
