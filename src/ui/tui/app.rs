@@ -6,12 +6,14 @@
 
 use crate::config;
 use crate::engine::board::Color as StoneColor;
-use crate::engine::estimate::{score, ScoringRules};
-use crate::engine::coord::Coord;
+use crate::engine::estimate::score;
 use crate::session::store::{ChatScope, ConnectionState, GameView, LogLevel, Store};
 use crate::session::{Command, SessionHandle};
 use crate::ui::challenge_options;
-use crate::ui::commands::{self, EstimateCommand, ScoreCommand, UndoCommand, UserCommand};
+use crate::ui::commands::{
+    self, EstimateCommand, GameMode, NewGameSpec, ScoreCommand, SgfAction, UndoCommand, UserCommand,
+};
+use crate::ui::new_game::{self, NewGameWizard, Outcome};
 use crate::ui::tui::board_render;
 use crate::ui::tui::input::InputState;
 use crate::ui::tui::layout::{self, Scene};
@@ -90,6 +92,41 @@ impl Default for LoginState {
     }
 }
 
+/// The count of a local game with the dead stones marked so far (none
+/// until counting has started).
+fn local_count(game: &GameView) -> crate::engine::estimate::ScoreSummary {
+    let dead = if game.estimate_active {
+        game.estimate_dead.clone()
+    } else {
+        Default::default()
+    };
+    let snapshot = game.active_game_ref();
+    score(
+        game.board(),
+        &dead,
+        game.komi,
+        game.rule_set(),
+        (snapshot.captures(StoneColor::Black), snapshot.captures(StoneColor::White)),
+    )
+}
+
+/// A pending SGF path entry.
+struct PathPrompt {
+    action: SgfAction,
+    input: InputState,
+    error: Option<String>,
+}
+
+impl PathPrompt {
+    fn new(action: SgfAction) -> Self {
+        Self {
+            action,
+            input: InputState::new(),
+            error: None,
+        }
+    }
+}
+
 impl LoginState {
     fn reset(&mut self) {
         self.password.clear();
@@ -106,6 +143,12 @@ struct App {
     focus: FocusPane,
     login: LoginState,
     overlay: Option<Overlay>,
+    /// The New Game flow, drawn above everything else while open.
+    new_game: Option<NewGameWizard>,
+    /// SGF import/export path entry.
+    path_prompt: Option<PathPrompt>,
+    /// Signed out but past the login screen, for local play.
+    offline: bool,
     notice: Option<(String, Instant)>,
     moves_scroll_back: u16,
     chat_scroll_back: u16,
@@ -126,12 +169,6 @@ struct App {
 
 impl App {
     fn new(session: SessionHandle, theme: Theme, startup: Startup) -> Self {
-        if startup.initial_game.is_none() {
-            session.send(Command::SetBoardSize {
-                game_id: Some(42),
-                size: 9,
-            });
-        }
         Self {
             session,
             theme,
@@ -140,6 +177,9 @@ impl App {
             focus: FocusPane::Board,
             login: LoginState::default(),
             overlay: None,
+            new_game: None,
+            path_prompt: None,
+            offline: false,
             notice: None,
             moves_scroll_back: 0,
             chat_scroll_back: 0,
@@ -170,8 +210,10 @@ impl App {
         self.notice = Some((text.into(), Instant::now()));
     }
 
+    /// The login screen is shown until the user signs in or chooses to play
+    /// offline (F1 → New Game → 摆谱 needs no account).
     fn show_login(&self) -> bool {
-        self.snapshot.username.is_none()
+        self.snapshot.username.is_none() && !self.offline
     }
 
     fn focused_game(&self) -> Option<&GameView> {
@@ -239,7 +281,9 @@ impl App {
                     } else {
                         self.login.username.push_str(&text);
                     }
-                } else if self.overlay.is_none() {
+                } else if let Some(prompt) = &mut self.path_prompt {
+                    prompt.input.insert_str(&text);
+                } else if self.overlay.is_none() && self.new_game.is_none() {
                     self.input.insert_str(&text);
                 }
                 self.dirty = true;
@@ -261,12 +305,14 @@ impl App {
         self.dirty = true;
         let (mx, my) = (mouse.column, mouse.row);
 
-        let cur_size = self.focused_game().map(|g| g.size).unwrap_or(9);
+        if self.new_game.is_some() || self.path_prompt.is_some() {
+            return;
+        }
         let est_active = self.focused_game().map(|g| g.estimate_active).unwrap_or(false);
 
         // 1. Header action buttons click
         let header_area = self.last_header_area.get();
-        if let Some(cmd_str) = widgets::header_action_at(mx, my, header_area, cur_size, est_active) {
+        if let Some(cmd_str) = widgets::header_action_at(mx, my, header_area, est_active) {
             let cmd = commands::parse(cmd_str);
             self.dispatch(cmd);
             return;
@@ -314,6 +360,14 @@ impl App {
         }
         self.dirty = true;
 
+        if self.path_prompt.is_some() {
+            self.handle_path_prompt_key(key);
+            return;
+        }
+        if self.new_game.is_some() {
+            self.handle_new_game_key(key);
+            return;
+        }
         if self.overlay.is_some() {
             match key.code {
                 KeyCode::Esc => self.overlay = None,
@@ -391,9 +445,9 @@ impl App {
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => self.focus = FocusPane::Chat,
-            KeyEvent { code: KeyCode::F(1), .. } => self.dispatch(UserCommand::BoardSize(9)),
-            KeyEvent { code: KeyCode::F(2), .. } => self.dispatch(UserCommand::BoardSize(13)),
-            KeyEvent { code: KeyCode::F(3), .. } => self.dispatch(UserCommand::BoardSize(19)),
+            KeyEvent { code: KeyCode::F(1), .. } => {
+                self.dispatch(UserCommand::NewGame(NewGameSpec::default()))
+            }
             KeyEvent { code: KeyCode::F(4), .. } => self.dispatch(UserCommand::PresetKo),
             KeyEvent { code: KeyCode::F(5), .. } => self.dispatch(UserCommand::Estimate(EstimateCommand::Auto)),
             KeyEvent { code: KeyCode::F(6), .. } => self.dispatch(UserCommand::Estimate(EstimateCommand::Exit)),
@@ -486,6 +540,11 @@ impl App {
 
     fn handle_login_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::F(1) => {
+                self.offline = true;
+                self.login.message.clear();
+                self.dispatch(UserCommand::NewGame(NewGameSpec::default()));
+            }
             KeyCode::Tab => self.login.focus_password = !self.login.focus_password,
             KeyCode::BackTab => self.login.focus_password = !self.login.focus_password,
             KeyCode::Enter => {
@@ -585,6 +644,7 @@ impl App {
                 self.session.send(Command::Logout);
                 self.login.reset();
                 self.overlay = None;
+                self.offline = false;
             }
             UserCommand::Reconnect => self.session.send(Command::Reconnect),
             UserCommand::Refresh => self.session.send(Command::RefreshLobby),
@@ -639,27 +699,18 @@ impl App {
                     channel: self.snapshot.world_channel.clone(),
                 })),
             },
-            UserCommand::BoardSize(size) => {
-                self.session.send(Command::SetBoardSize { game_id, size });
-                self.focus = FocusPane::Board;
-                self.moves_scroll_back = 0;
-            }
+            UserCommand::NewGame(spec) => self.open_new_game(spec),
             UserCommand::PresetKo => {
-                let gid = game_id.unwrap_or(42);
-                self.session.send(Command::SetBoardSize { game_id: Some(gid), size: 9 });
-                let demo_moves = [
-                    Coord::new(1, 9),
-                    Coord::new(2, 8),
-                    Coord::new(0, 8),
-                    Coord::new(1, 7),
-                    Coord::new(1, 8),
-                    Coord::new(0, 9),
-                ];
-                for coord in demo_moves {
-                    self.session.send(Command::PlayMove { game_id: gid, coord });
-                }
+                self.session.send(crate::ui::preset_ko_command());
                 self.focus = FocusPane::Board;
-                self.set_notice("Preset: Ko shape ready at A8/A9. Try capturing [a8]!");
+                self.set_notice("Preset: a ko at the lower left. Black to play — take it with [c2].");
+            }
+            UserCommand::PromptSgfPath(action) => {
+                if action == SgfAction::Save && game_id.is_none() {
+                    self.set_notice("no game open");
+                } else {
+                    self.path_prompt = Some(PathPrompt::new(action));
+                }
             }
             UserCommand::LoadSgf(game_id) => self.session.send(Command::LoadSgf(game_id)),
             UserCommand::LoadSgfFile(path) => {
@@ -824,6 +875,26 @@ impl App {
             self.set_notice("no game open");
             return;
         };
+        if game.local {
+            let summary = local_count(game);
+            let text = format!(
+                "{}\n规则 {} · komi {}\n\n{summary}\n{}\n\n\
+                 Dead stones: {} marked{}. Click a group to toggle it, `undo` to resume play.",
+                game.title(),
+                game.rule_set().label(),
+                game.komi,
+                summary.breakdown(),
+                game.estimate_dead.len(),
+                if game.estimate_active { "" } else { " — detecting dead stones, the count updates in the log" },
+            );
+            if !game.estimate_active {
+                if let Some(game_id) = self.active_game_id() {
+                    self.session.send(Command::EstimateAuto { game_id });
+                }
+            }
+            self.overlay = Some(Overlay::new("数子 / Count", text));
+            return;
+        }
         let mut lines = vec![game.title()];
         if game.phase == crate::session::store::GamePhase::StoneRemoval {
             lines.push("server phase: stone removal (official)".to_string());
@@ -848,7 +919,7 @@ impl App {
                 game.board(),
                 &game.scoring_dead,
                 game.komi,
-                ScoringRules::from_ogs(&game.rules),
+                game.rule_set(),
                 (
                     game.game.captures(StoneColor::Black),
                     game.game.captures(StoneColor::White),
@@ -918,11 +989,135 @@ impl App {
         if let Some(overlay) = &self.overlay {
             widgets::draw_overlay(frame, area, overlay, &self.theme);
         }
+        if let Some(wizard) = &self.new_game {
+            widgets::draw_new_game(frame, area, wizard, &self.theme);
+        }
+        if let Some(prompt) = &self.path_prompt {
+            widgets::draw_path_prompt(
+                frame,
+                area,
+                prompt.action.prompt(),
+                &prompt.input,
+                prompt.error.as_deref(),
+                &self.theme,
+            );
+        }
+    }
+
+    fn open_new_game(&mut self, spec: NewGameSpec) {
+        if spec.mode == Some(GameMode::VsAi) && self.snapshot.username.is_none() {
+            self.set_notice("vs AI needs a logged-in OGS account; `new local` plays offline");
+            return;
+        }
+        let wizard = NewGameWizard::new(
+            spec,
+            self.snapshot.username.is_some(),
+            self.snapshot.online_bots.clone(),
+        );
+        if wizard.step().is_none() {
+            let spec = wizard.spec.clone();
+            self.start_new_game(&spec);
+        } else {
+            self.overlay = None;
+            self.new_game = Some(wizard);
+        }
+    }
+
+    fn start_new_game(&mut self, spec: &NewGameSpec) {
+        if spec.mode == Some(GameMode::VsAi) && self.snapshot.username.is_none() {
+            self.set_notice("vs AI needs a logged-in OGS account");
+            return;
+        }
+        match new_game::start_command(spec, &self.snapshot.online_bots) {
+            Ok(command) => {
+                if let Command::CreateChallenge(options) = &command {
+                    self.set_notice(format!(
+                        "challenging {} ({}x{}, {}, unranked)…",
+                        options.opponent, options.board_size, options.board_size, options.rules
+                    ));
+                } else {
+                    self.focus = FocusPane::Board;
+                    self.moves_scroll_back = 0;
+                }
+                self.session.send(command);
+            }
+            Err(error) => self.set_notice(error),
+        }
+    }
+
+    fn handle_new_game_key(&mut self, key: KeyEvent) {
+        let Some(wizard) = &mut self.new_game else { return };
+        let outcome = match key.code {
+            KeyCode::Esc => {
+                self.new_game = None;
+                return;
+            }
+            KeyCode::Backspace | KeyCode::Left => {
+                if !wizard.back() {
+                    self.new_game = None;
+                }
+                return;
+            }
+            KeyCode::Up => {
+                wizard.move_by(-1);
+                return;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                wizard.move_by(1);
+                return;
+            }
+            KeyCode::Enter | KeyCode::Right => wizard.confirm(),
+            KeyCode::Char(ch) if ch.is_ascii_digit() && ch != '0' => {
+                wizard.choose(ch as usize - '1' as usize)
+            }
+            _ => return,
+        };
+        match outcome {
+            Outcome::Next => {}
+            Outcome::Blocked(reason) => self.set_notice(reason),
+            Outcome::Done(spec) => {
+                self.new_game = None;
+                self.start_new_game(&spec);
+            }
+        }
+    }
+
+    fn handle_path_prompt_key(&mut self, key: KeyEvent) {
+        let Some(prompt) = &mut self.path_prompt else { return };
+        match key.code {
+            KeyCode::Esc => self.path_prompt = None,
+            KeyCode::Enter => {
+                let action = prompt.action;
+                match action.with_path(&prompt.input.buffer()) {
+                    Some(command) => {
+                        self.path_prompt = None;
+                        self.dispatch(command);
+                    }
+                    None => prompt.error = Some("type a file path, or Esc to cancel".into()),
+                }
+            }
+            KeyCode::Backspace => prompt.input.backspace(),
+            KeyCode::Delete => prompt.input.delete(),
+            KeyCode::Left => prompt.input.left(),
+            KeyCode::Right => prompt.input.right(),
+            KeyCode::Home => prompt.input.home(),
+            KeyCode::End => prompt.input.end(),
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                prompt.input.clear()
+            }
+            KeyCode::Char(ch)
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                prompt.error = None;
+                prompt.input.insert(ch);
+            }
+            _ => {}
+        }
     }
 
     fn draw_game(&self, frame: &mut Frame, area: ratatui::layout::Rect, game: &GameView) {
         let layout = layout::split_game(area, game.size);
-        widgets::draw_header(frame, layout.header, &self.theme, game.size, game.estimate_active);
+        widgets::draw_header(frame, layout.header, &self.theme, game.estimate_active);
         self.last_header_area.set(layout.header);
         self.last_board_area.set(layout.board);
         self.last_moves_area.set(layout.moves);
@@ -975,7 +1170,7 @@ impl App {
 
     fn draw_lobby(&self, frame: &mut Frame, area: ratatui::layout::Rect) {
         let layout = layout::split_lobby(area);
-        widgets::draw_header(frame, layout.header, &self.theme, 9, false);
+        widgets::draw_header(frame, layout.header, &self.theme, false);
         self.last_header_area.set(layout.header);
         widgets::render_pane(
             frame,
@@ -1167,6 +1362,95 @@ pub async fn run(session: SessionHandle, startup: Startup) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::rest_client::ChallengeClock;
+    use crate::ui::commands::{ChallengeClockSpec, ChallengeSpec};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    async fn app() -> App {
+        let config = crate::session::SessionConfig {
+            world_channel: "en".to_string(),
+            persist_path: None,
+        };
+        let session = SessionHandle::spawn_with_store(config, Store::new("en"));
+        let mut app = App::new(
+            session,
+            Theme::new(ColorSupport::TrueColor),
+            Startup::default(),
+        );
+        app.refresh().await;
+        app
+    }
+
+    async fn settle(app: &mut App) {
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            app.refresh().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn f1_on_the_login_screen_starts_an_offline_baipu_game_by_keyboard() {
+        let mut app = app().await;
+        assert!(app.show_login(), "starts on the login screen");
+        assert!(app.snapshot.games.is_empty(), "no scratch board at startup");
+
+        app.handle_key(key(KeyCode::F(1)));
+        assert!(!app.show_login());
+        assert!(app.new_game.is_some());
+        app.handle_key(key(KeyCode::Char('3'))); // 19×19
+        // vs AI is disabled while signed out: Enter on it is refused.
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.notice.as_ref().is_some_and(|(text, _)| text.contains("login")));
+        app.handle_key(key(KeyCode::Char('2'))); // 摆谱
+        app.handle_key(key(KeyCode::Char('2'))); // Japanese/Korean
+        assert!(app.new_game.is_none());
+        settle(&mut app).await;
+
+        let game = app.focused_game().expect("local game opened").clone();
+        assert!(game.local);
+        assert_eq!(game.size, 19);
+        assert_eq!(game.rule_set(), crate::engine::rules::RuleSet::JapaneseKorean);
+
+        // Typing a move and two passes reaches counting.
+        for line in ["play Q16", "pass", "pass"] {
+            for ch in line.chars() {
+                app.handle_key(key(KeyCode::Char(ch)));
+            }
+            app.handle_key(key(KeyCode::Enter));
+        }
+        settle(&mut app).await;
+        let game = app.focused_game().unwrap();
+        assert_eq!(game.move_number(), 3);
+        // Counting runs in the background; the UI stays responsive meanwhile.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !app.focused_game().unwrap().estimate_active && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            app.refresh().await;
+        }
+        let game = app.focused_game().unwrap();
+        assert!(game.estimate_active, "two passes start counting");
+        assert!(game.estimate_summary.is_some());
+
+        // `sgf save` with no path opens the prompt; Esc cancels it.
+        for ch in "sgf save".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.path_prompt.is_some());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.path_prompt.is_none());
+
+        // `size` is gone and points at New Game.
+        for ch in "size 9".chars() {
+            app.handle_key(key(KeyCode::Char(ch)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.notice.as_ref().is_some_and(|(text, _)| text.contains("new")));
+    }
 
     #[test]
     fn focus_cycles_both_ways() {

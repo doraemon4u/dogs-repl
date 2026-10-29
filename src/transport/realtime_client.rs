@@ -1,62 +1,135 @@
-//! Socket.IO transport for online-go.com (OGS).
+//! Realtime transport for online-go.com (OGS).
 //!
-//! The wire conventions here are taken from `online-go/goban`'s `GobanSocket`,
-//! which is OGS's own reference implementation of this protocol.
+//! OGS's realtime API is *not* Socket.IO: it is a plain WebSocket at
+//! `wss://online-go.com` carrying one JSON array per message. This matches
+//! `online-go/goban`'s `GobanSocket`, OGS's own reference client. An earlier
+//! version spoke Socket.IO framing; the server still pushed chat through it,
+//! but never answered requests, so `authenticate` (and with it chat sending)
+//! silently failed.
 //!
-//! Outbound — one JSON array per message:
+//! Outbound:
 //!
 //! ```text
 //! [command, data]        notify   (no reply expected)
-//! [command]              notify   (no data)
 //! [command, data, rid]   request  (reply carries the same rid)
 //! ```
 //!
 //! Inbound — the first array element decides how to read it:
 //!
 //! ```text
-//! [rid, data, error]     correlated reply to our request
-//! [command, data]        unsolicited server push
+//! [rid, data, error]     reply to our request
+//! [command, data]        server push (["ERROR", text] is a server error)
 //! ```
 //!
-//! Two things differ from goban and are deliberate:
-//!
-//! * We send `authenticate` as a request rather than a notify, so the server
-//!   tells us whether the credential was accepted instead of leaving us to
-//!   assume success. `user/update` is still accepted as confirmation.
-//! * We must register `on("error", ..)` separately. `rust_socketio` folds the
-//!   event name `"ERROR"` case-insensitively into `Event::Error`, which `on_any`
-//!   never receives — without this, server errors are dropped silently.
-//!
-//! Transport note: OGS rejects engine.io polling with
-//! `{"code":0,"message":"Transport unknown"}`, so WebSocket is mandatory.
+//! On every (re)connect `authenticate` is written first, before anything that
+//! was queued while offline, exactly like goban's open handler.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures_util::FutureExt;
-use rust_socketio::asynchronous::{Client, ClientBuilder, ReconnectSettings};
-use rust_socketio::{Event, Payload, TransportType};
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::RwLock;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
+use tokio_tungstenite::tungstenite::Message;
 
-const SOCKET_URL: &str = "https://online-go.com/socket.io/";
+const SOCKET_URL: &str = "wss://online-go.com";
 const PING_INTERVAL_SECS: u64 = 20;
-const RECONNECT_DELAY_SECS: u64 = 5;
-const MAX_RECONNECT_ATTEMPTS: u32 = 10;
-const MAX_CONNECT_ATTEMPTS: u32 = 5;
+/// First retry delay after a failed or dropped connection; doubles up to
+/// [`MAX_RETRY_SECS`].
 const INITIAL_CONNECT_RETRY_SECS: u64 = 2;
+const MAX_RETRY_SECS: u64 = 30;
+/// Give up on a TCP/TLS/WebSocket handshake after this long.
+const CONNECT_TIMEOUT_SECS: u64 = 15;
 /// How long a request may stay unanswered before it is failed and forgotten.
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// How long to wait for the server to acknowledge `authenticate`.
 const AUTH_WATCHDOG_SECS: u64 = 12;
+/// How long a sent chat line may stay unconfirmed before the user is told.
+const CHAT_CONFIRM_SECS: u64 = 10;
 
-type Outbound = (String, Payload);
+/// One queued frame: the command, its arguments, and for requests the id the
+/// reply will carry.
+type Outbound = (String, Payload, Option<u64>);
+
+/// Name of an inbound frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Event {
+    /// A reply (`[rid, data, error]`).
+    Message,
+    /// `["ERROR", …]`.
+    Error,
+    Custom(String),
+}
+
+impl Event {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Message => "message",
+            Self::Error => "error",
+            Self::Custom(name) => name,
+        }
+    }
+}
+
+impl From<&str> for Event {
+    fn from(name: &str) -> Self {
+        if name.eq_ignore_ascii_case("error") {
+            Self::Error
+        } else if name == "message" {
+            Self::Message
+        } else {
+            Self::Custom(name.to_string())
+        }
+    }
+}
+
+impl std::fmt::Display for Event {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The values after the command name in a frame.
+#[derive(Debug, Clone, PartialEq)]
+enum Payload {
+    Text(Vec<Value>),
+}
+
+/// Serialises `[command, …values, rid?]`.
+fn encode_frame(command: &str, payload: Payload, rid: Option<u64>) -> String {
+    let Payload::Text(values) = payload;
+    let mut frame = Vec::with_capacity(values.len() + 2);
+    frame.push(Value::from(command));
+    frame.extend(values);
+    if let Some(rid) = rid {
+        frame.push(Value::from(rid));
+    }
+    Value::Array(frame).to_string()
+}
+
+/// OGS's `n2s`: a number in base 62, digits `0-9A-Za-z`.
+fn base62(mut n: u64) -> String {
+    const DIGITS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if n == 0 {
+        return "0".to_string();
+    }
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push(DIGITS[(n % 62) as usize]);
+        n /= 62;
+    }
+    digits.reverse();
+    String::from_utf8(digits).expect("base-62 digits are ASCII")
+}
 
 /// A normalised OGS event, delivered in order to a single consumer.
 #[derive(Debug, Clone)]
 pub enum RealtimeEvent {
+    /// The online-bot catalog (`active-bots`), keyed by player id.
+    ActiveBots(Value),
     /// Socket handshake completed.
     Connected,
     /// Socket torn down.
@@ -141,7 +214,15 @@ impl GameList {
 struct Inner {
     jwt: String,
     tx: UnboundedSender<RealtimeEvent>,
-    socket: Arc<RwLock<Option<Client>>>,
+    /// Writer for the live connection; `None` while offline. Frames queued
+    /// while offline wait here, like goban's `send_queue`.
+    link: tokio::sync::watch::Sender<Option<UnboundedSender<String>>>,
+    /// Set by `disconnect`; stops reconnecting.
+    closed: AtomicBool,
+    shutdown: tokio::sync::Notify,
+    /// Bumped on every connection, so per-connection timers can tell
+    /// whether they still belong to the current socket.
+    generation: AtomicU64,
     next_rid: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, String>>>,
     seen_chat_ids: Mutex<std::collections::HashSet<String>>,
@@ -151,7 +232,19 @@ struct Inner {
     out_rx: Mutex<Option<UnboundedReceiver<Outbound>>>,
     worker_started: AtomicBool,
     authenticated: AtomicBool,
-    watchdog_started: AtomicBool,
+    /// How many times the server accepted our JWT on this client.
+    auth_count: AtomicU64,
+    /// The player id the server authenticated us as; the first part of
+    /// every chat message id.
+    user_id: AtomicI64,
+    /// Epoch milliseconds of the last chat message id, kept strictly
+    /// increasing.
+    last_chat_stamp: Mutex<u64>,
+    /// Wire channels we are subscribed to, replayed after a reconnect.
+    joined_channels: Mutex<std::collections::BTreeSet<String>>,
+    /// `chat/send` requests the server has not answered yet:
+    /// request id → wire channel.
+    pending_chat: Arc<Mutex<HashMap<u64, String>>>,
 }
 
 impl Inner {
@@ -160,7 +253,10 @@ impl Inner {
         Self {
             jwt,
             tx,
-            socket: Arc::new(RwLock::new(None)),
+            link: tokio::sync::watch::channel(None).0,
+            closed: AtomicBool::new(false),
+            shutdown: tokio::sync::Notify::new(),
+            generation: AtomicU64::new(0),
             next_rid: AtomicU64::new(1),
             pending: Arc::new(Mutex::new(HashMap::new())),
             seen_chat_ids: Mutex::new(std::collections::HashSet::new()),
@@ -168,32 +264,74 @@ impl Inner {
             out_rx: Mutex::new(Some(out_rx)),
             worker_started: AtomicBool::new(false),
             authenticated: AtomicBool::new(false),
-            watchdog_started: AtomicBool::new(false),
+            auth_count: AtomicU64::new(0),
+            user_id: AtomicI64::new(0),
+            last_chat_stamp: Mutex::new(0),
+            joined_channels: Mutex::new(std::collections::BTreeSet::new()),
+            pending_chat: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Re-joins every chat channel after the server accepts a reconnect's
+    /// JWT. (The session re-opens the active game itself.)
+    fn replay_subscriptions(&self) {
+        let channels: Vec<String> = self
+            .joined_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect();
+        for channel in channels {
+            self.notify("chat/join", json!({ "channel": channel }));
+        }
+    }
+
+    /// A chat message id in the form OGS's own client makes them
+    /// (`chatSoftUid`): base-62 player id, a dot, base-62 epoch milliseconds.
+    ///
+    /// Ids must stay unique across sessions. OGS keeps them in the channel
+    /// backlog, and clients (this one and the web client) silently drop a
+    /// line whose id they have already seen.
+    fn next_chat_uuid(&self) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let stamp = {
+            let mut last = self
+                .last_chat_stamp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *last = now.max(*last + 1);
+            *last
+        };
+        let user_id = self.user_id.load(Ordering::Relaxed);
+        let user = if user_id < 0 {
+            format!("-{}", base62(user_id.unsigned_abs()))
+        } else {
+            base62(user_id.unsigned_abs())
+        };
+        format!("{user}.{}", base62(stamp))
     }
 
     /// `[command, data, rid]` — the server answers with the same rid.
     fn request(&self, command: &str, data: Value) {
-        // OGS channel subscriptions and events (such as `chat/join`, `chat/part`, `chat/send`)
-        // are fire-and-forget push notifications without an RPC callback acknowledgment.
-        // Enqueueing them as RPC requests causes an inevitable 30-second timeout error.
-        if command == "chat/join"
-            || command == "chat/part"
-            || command == "chat/send"
-            || command == "game/disconnect"
-        {
+        // goban sends these without a callback and nothing here reads their
+        // replies, so they stay notifications. (OGS does answer any frame
+        // that carries an id; `send_chat` relies on that.)
+        if command == "chat/join" || command == "chat/part" || command == "game/disconnect" {
             self.notify(command, data);
             return;
         }
 
-        let rid = self.next_rid.fetch_add(1, Ordering::Relaxed);
-        self.pending
-            .lock()
-            .expect("pending map poisoned")
-            .insert(rid, command.to_string());
+        let rid = self.register_request(command);
+        self.enqueue(command, Payload::Text(vec![data]), Some(rid));
+    }
 
-        // Drop the pending entry and tell the user if the server never
-        // answers. Without this a lost reply leaves the UI waiting forever.
+    /// Allocates a request id, remembers which command it answers, and
+    /// reports an error if no reply arrives in time.
+    fn register_request(&self, command: &str) -> u64 {
+        let rid = self.track_request(command);
         let pending = Arc::clone(&self.pending);
         let tx = self.tx.clone();
         let label = command.to_string();
@@ -210,13 +348,27 @@ impl Inner {
                 )));
             }
         });
+        rid
+    }
 
-        self.emit(command, Payload::Text(vec![data, Value::from(rid)]));
+    /// Allocates a request id and remembers which command it answers. The
+    /// caller owns the timeout.
+    fn track_request(&self, command: &str) -> u64 {
+        let rid = self.next_rid.fetch_add(1, Ordering::Relaxed);
+        self.pending
+            .lock()
+            .expect("pending map poisoned")
+            .insert(rid, command.to_string());
+        rid
+    }
+
+    fn connected(&self) -> bool {
+        self.link.borrow().is_some()
     }
 
     /// `[command, data]` — fire and forget, matching goban's no-callback send.
     fn notify(&self, command: &str, data: Value) {
-        self.emit(command, Payload::Text(vec![data]));
+        self.enqueue(command, Payload::Text(vec![data]), None);
     }
 
     fn is_authenticated(&self) -> bool {
@@ -225,13 +377,14 @@ impl Inner {
 
     /// Enqueues an outbound message. A single worker drains this queue in
     /// order, so request ordering is stable.
-    fn emit(&self, command: &str, payload: Payload) {
+    fn enqueue(&self, command: &str, payload: Payload, rid: Option<u64>) {
         if tracing_enabled() {
-            eprintln!("[trace] -> {command} {}", payload_label(&payload));
+            let id = rid.map(|rid| format!(" (ack {rid})")).unwrap_or_default();
+            eprintln!("[trace] -> {command} {}{id}", payload_label(&payload));
         }
         if self
             .out_tx
-            .send((command.to_string(), payload))
+            .send((command.to_string(), payload, rid))
             .is_err()
         {
             let _ = self.tx.send(RealtimeEvent::Error(format!(
@@ -240,32 +393,64 @@ impl Inner {
         }
     }
 
-    /// Starts the ordered outbound worker once per client.
-    fn start_outbound_worker(&self) {
+    /// Starts the ordered outbound worker once per client. Frames wait until
+    /// a connection exists, then go out in order.
+    fn start_outbound_worker(self: &Arc<Self>) {
         if self.worker_started.swap(true, Ordering::Relaxed) {
             return;
         }
         let Some(mut rx) = self.out_rx.lock().expect("out_rx poisoned").take() else {
             return;
         };
-        let socket = Arc::clone(&self.socket);
-        let tx = self.tx.clone();
+        let inner = Arc::clone(self);
         tokio::spawn(async move {
-            while let Some((command, payload)) = rx.recv().await {
-                let guard = socket.read().await;
-                let Some(client) = guard.as_ref() else {
-                    let _ = tx.send(RealtimeEvent::Error(format!(
-                        "cannot send `{command}`: socket not connected"
-                    )));
-                    continue;
-                };
-                if let Err(error) = client.emit(command.clone(), payload).await {
-                    let _ = tx.send(RealtimeEvent::Error(format!(
-                        "send `{command}` failed: {error}"
-                    )));
+            let mut link = inner.link.subscribe();
+            while let Some((command, payload, rid)) = rx.recv().await {
+                let frame = encode_frame(&command, payload, rid);
+                loop {
+                    let writer = link.borrow_and_update().clone();
+                    if let Some(writer) = writer {
+                        if writer.send(frame.clone()).is_ok() {
+                            break;
+                        }
+                    }
+                    if inner.closed.load(Ordering::Relaxed) || link.changed().await.is_err() {
+                        return;
+                    }
                 }
             }
         });
+    }
+
+    /// Decodes one inbound WebSocket text message.
+    fn handle_frame(&self, text: &str) {
+        let Ok(Value::Array(mut values)) = serde_json::from_str::<Value>(text) else {
+            return;
+        };
+        match values.first() {
+            Some(Value::Number(_)) => self.dispatch(Event::Message, Payload::Text(values)),
+            Some(Value::String(name)) => {
+                let event = Event::from(name.as_str());
+                let data = if values.len() > 1 {
+                    values.swap_remove(1)
+                } else {
+                    Value::Null
+                };
+                if event == Event::Error {
+                    if tracing_enabled() {
+                        eprintln!("[trace] <- ERROR {data}");
+                    }
+                    let message = match &data {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    let _ = self.tx.send(RealtimeEvent::Error(format!("server: {message}")));
+                    return;
+                }
+                self.dispatch(event, Payload::Text(vec![data]));
+            }
+            _ => {}
+        }
     }
 
     fn dispatch(&self, event: Event, payload: Payload) {
@@ -277,15 +462,7 @@ impl Inner {
             );
         }
 
-        let values = match payload {
-            Payload::Text(values) => values,
-            Payload::Binary(_) => return,
-            #[allow(deprecated)]
-            Payload::String(raw) => match serde_json::from_str::<Value>(&raw) {
-                Ok(value) => vec![value],
-                Err(_) => return,
-            },
-        };
+        let Payload::Text(values) = payload;
 
         // A numeric first element means this is the answer to one of our
         // requests; anything else is a push event.
@@ -302,19 +479,36 @@ impl Inner {
                     .remove(&rid)
                     .unwrap_or_else(|| format!("#{rid}"));
                 let data = values.get(1).cloned().unwrap_or(Value::Null);
-                let error = values.get(2).cloned().filter(|value| !value.is_null());
+                let error = values
+                    .get(2)
+                    .cloned()
+                    .filter(|value| !value.is_null())
+                    .or_else(|| data.get("error").cloned().filter(|value| !value.is_null()));
 
                 if command == "authenticate" && error.is_none() {
                     self.send_authenticated(&data);
                 }
+                // A chat line is confirmed by this reply, never by an echo:
+                // OGS does not send a line back to the socket that sent it.
+                let chat_channel = if command == "chat/send" {
+                    self.pending_chat
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&rid)
+                } else {
+                    None
+                };
                 if let Some(error) = &error {
                     let message = error
                         .get("message")
                         .and_then(Value::as_str)
+                        .or_else(|| error.as_str())
                         .map_or_else(|| error.to_string(), str::to_string);
-                    let _ = self.tx.send(RealtimeEvent::Error(format!(
-                        "{command}: {message}"
-                    )));
+                    let text = match &chat_channel {
+                        Some(wire) => format!("OGS refused the message to {wire}: {message}"),
+                        None => format!("{command}: {message}"),
+                    };
+                    let _ = self.tx.send(RealtimeEvent::Error(text));
                 }
 
                 let _ = self.tx.send(RealtimeEvent::Response {
@@ -338,6 +532,7 @@ impl Inner {
         let event = match name {
             "net/pong" => RealtimeEvent::Heartbeat,
             "hostinfo" => RealtimeEvent::HostInfo(data),
+            "active-bots" => RealtimeEvent::ActiveBots(data),
             "notification" => RealtimeEvent::Notification(data),
             "active_game" => RealtimeEvent::ActiveGame(data),
             "gamelist-count" => {
@@ -561,13 +756,20 @@ impl Inner {
     }
 
     fn send_authenticated(&self, data: &Value) {
-        self.authenticated.store(true, Ordering::Relaxed);
+        let first = !self.authenticated.swap(true, Ordering::Relaxed);
         let user_id = data.get("id").and_then(Value::as_i64).unwrap_or(0);
         let username = data
             .get("username")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        if user_id != 0 {
+            self.user_id.store(user_id, Ordering::Relaxed);
+        }
+        // After a reconnect the server has forgotten our subscriptions.
+        if first && self.auth_count.fetch_add(1, Ordering::Relaxed) > 0 {
+            self.replay_subscriptions();
+        }
         let _ = self.tx.send(RealtimeEvent::Authenticated { user_id, username });
     }
 
@@ -621,116 +823,135 @@ impl RealtimeClient {
         self.inner.is_authenticated()
     }
 
-    /// Opens the socket and authenticates.
-    ///
-    /// The engine.io handshake fails often enough that a single attempt
-    /// strands the client with no socket, so this retries with backoff.
-    /// `rust_socketio`'s own reconnect only covers a drop *after* connect.
+    /// Opens the socket and keeps it open, reconnecting with backoff after
+    /// any failure or drop until [`disconnect`](Self::disconnect) is called.
     pub async fn connect(&self) {
-        let mut delay = INITIAL_CONNECT_RETRY_SECS;
-        for attempt in 1..=MAX_CONNECT_ATTEMPTS {
-            match self.try_connect().await {
-                Ok(()) => return,
-                Err(message) => {
-                    let _ = self.inner.tx.send(RealtimeEvent::Error(format!(
-                        "connect attempt {attempt}/{MAX_CONNECT_ATTEMPTS} failed: {message}"
-                    )));
-                    if attempt < MAX_CONNECT_ATTEMPTS {
-                        tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
-                        delay = (delay * 2).min(RECONNECT_DELAY_SECS * 4);
-                    }
-                }
-            }
-        }
-    }
-
-    async fn try_connect(&self) -> Result<(), String> {
         self.inner.start_outbound_worker();
-        self.inner.authenticated.store(false, Ordering::Relaxed);
-        let any_inner = Arc::clone(&self.inner);
-        let error_tx = self.inner.tx.clone();
-        let reconnect_inner = Arc::clone(&self.inner);
+        self.spawn_heartbeat();
+        let mut delay = INITIAL_CONNECT_RETRY_SECS;
+        let mut failures = 0u32;
+        while !self.inner.closed.load(Ordering::Relaxed) {
+            match self.run_connection().await {
+                Ok(()) => {
+                    failures = 0;
+                    delay = INITIAL_CONNECT_RETRY_SECS;
+                }
+                Err(message) => {
+                    failures += 1;
+                    let _ = self.inner.tx.send(RealtimeEvent::Error(format!(
+                        "connect attempt {failures} failed: {message}; retrying in {delay}s"
+                    )));
+                }
+            }
+            if self.inner.closed.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+                _ = self.inner.shutdown.notified() => break,
+            }
+            if failures > 0 {
+                delay = (delay * 2).min(MAX_RETRY_SECS);
+            }
+        }
+    }
 
-        let builder = ClientBuilder::new(SOCKET_URL)
-            .transport_type(TransportType::Websocket)
-            .reconnect(true)
-            .reconnect_delay(RECONNECT_DELAY_SECS, RECONNECT_DELAY_SECS * 2)
-            .max_reconnect_attempts(MAX_RECONNECT_ATTEMPTS as u8)
-            .on_any(move |event, payload, _client| {
-                let inner = Arc::clone(&any_inner);
-                async move {
-                    inner.dispatch(event, payload);
+    /// One connection: handshake, authenticate, then read until it closes.
+    /// `Ok` means it was connected and later dropped; `Err` means it never
+    /// connected.
+    async fn run_connection(&self) -> Result<(), String> {
+        let inner = &self.inner;
+        let mut request = SOCKET_URL
+            .into_client_request()
+            .map_err(|error| error.to_string())?;
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static(crate::transport::auth::USER_AGENT),
+        );
+        let (stream, _response) = tokio::time::timeout(
+            std::time::Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        .map_err(|_| format!("no answer from {SOCKET_URL} within {CONNECT_TIMEOUT_SECS}s"))?
+        .map_err(|error| error.to_string())?;
+        let (mut sink, mut source) = stream.split();
+
+        let (writer, mut frames) = unbounded_channel::<String>();
+        let write_task = tokio::spawn(async move {
+            while let Some(text) = frames.recv().await {
+                if sink.send(Message::Text(text)).await.is_err() {
+                    break;
                 }
-                .boxed()
-            })
-            // `on_any` only sees Event::Message and Event::Custom, and
-            // `Event::from("ERROR")` is Event::Error, so server-reported errors
-            // would never reach the dispatcher.
-            .on("error", move |payload, _client| {
-                let tx = error_tx.clone();
-                async move {
-                    let _ = tx.send(RealtimeEvent::Error(payload_text(&payload)));
-                }
-                .boxed()
-            })
-            .on_reconnect(move || {
-                let inner = Arc::clone(&reconnect_inner);
-                async move {
-                    let mut settings = ReconnectSettings::new();
-                    settings.address(SOCKET_URL);
-                    settings.auth(json!({ "auth": { "jwt": inner.jwt } }));
-                    // A reconnected socket is unauthenticated again.
-                    inner.authenticated.store(false, Ordering::Relaxed);
-                    let _ = inner.tx.send(RealtimeEvent::Connected);
-                    if let Some(client) = inner.socket.read().await.as_ref() {
-                        let _ = client
-                            .emit(
-                                "authenticate",
-                                Payload::Text(vec![inner.auth_body(), Value::from(0)]),
-                            )
-                            .await;
+            }
+            let _ = sink.close().await;
+        });
+
+        inner.authenticated.store(false, Ordering::Relaxed);
+        let generation = inner.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        // `authenticate` first, ahead of anything queued while offline.
+        let rid = inner.register_request("authenticate");
+        if tracing_enabled() {
+            eprintln!("[trace] -> authenticate <credential> (rid {rid})");
+        }
+        let _ = writer.send(encode_frame(
+            "authenticate",
+            Payload::Text(vec![inner.auth_body()]),
+            Some(rid),
+        ));
+        inner.link.send_replace(Some(writer));
+        let _ = inner.tx.send(RealtimeEvent::Connected);
+        self.spawn_auth_watchdog(generation);
+
+        loop {
+            if inner.closed.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::select! {
+                message = source.next() => match message {
+                    Some(Ok(Message::Text(text))) => inner.handle_frame(&text),
+                    Some(Ok(Message::Close(frame))) => {
+                        if !inner.closed.load(Ordering::Relaxed) {
+                            let reason = frame
+                                .map(|frame| format!("{} {}", frame.code, frame.reason))
+                                .unwrap_or_default();
+                            let _ = inner.tx.send(RealtimeEvent::Error(format!(
+                                "server closed the socket {reason}"
+                            )));
+                        }
+                        break;
                     }
-                    settings
-                }
-                .boxed()
-            });
-
-        match builder.connect().await {
-            Ok(client) => {
-                *self.inner.socket.write().await = Some(client);
-                let _ = self.inner.tx.send(RealtimeEvent::Connected);
-                self.authenticate();
-                self.spawn_heartbeat();
-                self.spawn_auth_watchdog();
-                Ok(())
+                    // Ping/pong is answered by tungstenite; OGS sends no binary.
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        let _ = inner
+                            .tx
+                            .send(RealtimeEvent::Error(format!("socket read failed: {error}")));
+                        break;
+                    }
+                    None => break,
+                },
+                _ = inner.shutdown.notified() => break,
             }
-            // `IncompleteResponseFromEngineIo` renders as just "EngineIO Error"
-            // and discards the cause, so unwrap it for the log.
-            Err(rust_socketio::Error::IncompleteResponseFromEngineIo(inner)) => {
-                Err(format!("{inner:?}"))
-            }
-            Err(other) => Err(other.to_string()),
         }
+
+        inner.link.send_replace(None);
+        inner.authenticated.store(false, Ordering::Relaxed);
+        // Let the writer flush a close frame, then stop it.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), write_task).await;
+        let _ = inner.tx.send(RealtimeEvent::Disconnected);
+        Ok(())
     }
 
-    /// Closes the socket and drops unresolved requests.
+    /// Closes the socket for good and drops unresolved requests.
     pub async fn disconnect(&self) {
-        let taken = self.inner.socket.write().await.take();
+        self.inner.closed.store(true, Ordering::Relaxed);
         self.inner.pending.lock().expect("pending map poisoned").clear();
-        if let Some(client) = taken {
-            if let Err(e) = client.disconnect().await {
-                let _ = self.inner.tx.send(RealtimeEvent::Error(format!(
-                    "disconnect failed: {e}"
-                )));
-            }
+        let was_connected = self.inner.link.send_replace(None).is_some();
+        self.inner.shutdown.notify_waiters();
+        if !was_connected {
+            let _ = self.inner.tx.send(RealtimeEvent::Disconnected);
         }
-        let _ = self.inner.tx.send(RealtimeEvent::Disconnected);
-    }
-
-    /// Offers the credential to the server.
-    pub fn authenticate(&self) {
-        let body = self.inner.auth_body();
-        self.inner.request("authenticate", body);
     }
 
     /// `net/ping` — OGS treats a silent socket as offline.
@@ -805,36 +1026,109 @@ impl RealtimeClient {
         );
     }
 
-    /// `chat/join` — subscribes to a world chat channel and requests channel history.
-    /// In the OGS realtime protocol, channel subscriptions are fire-and-forget notifications (`notify`),
-    /// not RPC requests with an ACK callback ID.
+    /// `chat/join` — subscribes to a world chat channel. OGS answers with
+    /// `chat-join` (who is there) and the recent backlog as `chat-message`
+    /// pushes. Sent without a request id, like goban.
+    ///
+    /// Only the OGS wire name (e.g. `global-english`) is sent: join, part,
+    /// and send must all use the same room id.
     pub fn chat_join(&self, channel: &str) {
         let wire = crate::session::store::to_ogs_wire_channel(channel);
-        self.inner.notify("chat/join", json!({ "channel": wire }));
-        let raw = channel.trim().trim_start_matches('#');
-        if !raw.is_empty() && raw != wire {
-            self.inner.notify("chat/join", json!({ "channel": raw }));
+        if wire.is_empty() {
+            return;
         }
+        self.inner
+            .joined_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(wire.clone());
+        self.inner.notify("chat/join", json!({ "channel": wire }));
     }
 
     /// `chat/part` — leaves a world chat channel.
     pub fn chat_part(&self, channel: &str) {
         let wire = crate::session::store::to_ogs_wire_channel(channel);
+        self.inner
+            .joined_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&wire);
         self.inner.notify("chat/part", json!({ "channel": wire }));
-        let raw = channel.trim().trim_start_matches('#');
-        if !raw.is_empty() && raw != wire {
-            self.inner.notify("chat/part", json!({ "channel": raw }));
-        }
     }
 
-    /// `chat/send` — posts to a world chat channel.
-    pub fn send_chat(&self, channel: &str, message: &str) {
+    /// Wire channels currently subscribed.
+    #[cfg(test)]
+    pub fn joined_channels(&self) -> Vec<String> {
+        self.inner
+            .joined_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// `chat/send` — posts to a world chat channel and returns its uuid.
+    ///
+    /// OGS delivers the line to everyone else in the room but never sends
+    /// it back to this socket, so the caller shows it locally. Instead the
+    /// frame carries a request id: OGS answers `[rid, null, null]` once it
+    /// has accepted the line and `[rid, null, error]` if it refused it.
+    /// Silence for [`CHAT_CONFIRM_SECS`] is reported.
+    pub fn send_chat(&self, channel: &str, message: &str) -> String {
         let wire = crate::session::store::to_ogs_wire_channel(channel);
-        let uuid = self.next_uuid();
-        self.inner.notify(
+        let needs_join = !self
+            .inner
+            .joined_channels
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&wire);
+        if needs_join {
+            self.chat_join(&wire);
+        }
+        let uuid = self.inner.next_chat_uuid();
+        // The line is on screen already; when it comes back in the backlog
+        // after a rejoin, it must not be shown twice.
+        self.inner
+            .seen_chat_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uuid.clone());
+        let rid = self.inner.track_request("chat/send");
+        self.inner
+            .pending_chat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(rid, wire.clone());
+        self.inner.enqueue(
             "chat/send",
-            json!({ "channel": wire, "uuid": uuid, "message": message }),
+            Payload::Text(vec![
+                json!({ "channel": wire, "uuid": uuid, "message": message }),
+            ]),
+            Some(rid),
         );
+
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(CHAT_CONFIRM_SECS)).await;
+            let unanswered = inner
+                .pending_chat
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&rid);
+            if let Some(wire) = unanswered {
+                inner
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&rid);
+                let _ = inner.tx.send(RealtimeEvent::Error(format!(
+                    "chat to {wire} was not confirmed by OGS within {CHAT_CONFIRM_SECS}s \
+                     (no reply; the connection may have dropped), so it may not have been delivered"
+                )));
+            }
+        });
+        uuid
     }
 
     /// `chat/topic` — changes a channel topic.
@@ -854,21 +1148,14 @@ impl RealtimeClient {
         self.inner.request("net/route_latency", json!({}));
     }
 
-    fn next_uuid(&self) -> String {
-        let uuid = self.inner.next_rid.fetch_add(1, Ordering::Relaxed);
-        format!("ogs-tui-{uuid}")
-    }
-
-    /// Warns if the socket is up but the credential was never accepted. A
-    /// pong alone proves connectivity, not authorisation.
-    fn spawn_auth_watchdog(&self) {
+    /// Warns if this connection is up but the credential was never accepted.
+    /// A pong alone proves connectivity, not authorisation.
+    fn spawn_auth_watchdog(&self, generation: u64) {
         let inner = Arc::clone(&self.inner);
-        if inner.watchdog_started.swap(true, Ordering::Relaxed) {
-            return;
-        }
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(AUTH_WATCHDOG_SECS)).await;
-            if inner.socket.read().await.is_some() && !inner.is_authenticated() {
+            let current = inner.generation.load(Ordering::Relaxed) == generation;
+            if current && inner.connected() && !inner.is_authenticated() {
                 let _ = inner.tx.send(RealtimeEvent::Error(format!(
                     "socket connected but authentication did not complete within {AUTH_WATCHDOG_SECS}s; \
                      check that /ui/config returned a user_jwt for the logged-in account"
@@ -877,21 +1164,22 @@ impl RealtimeClient {
         });
     }
 
+    /// `net/ping` every [`PING_INTERVAL_SECS`] while connected; OGS treats
+    /// a silent socket as offline.
     fn spawn_heartbeat(&self) {
         let inner = Arc::clone(&self.inner);
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
-            // The first tick resolves immediately; skip it so we do not ping the
-            // instant after connecting.
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(PING_INTERVAL_SECS));
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if inner.socket.read().await.is_none() {
+                if inner.closed.load(Ordering::Relaxed) {
                     return;
                 }
-                // Go through the ordered queue so a heartbeat cannot jump in
-                // front of an earlier request.
-                inner.notify("net/ping", Inner::ping_body());
+                if inner.connected() {
+                    inner.notify("net/ping", Inner::ping_body());
+                }
             }
         });
     }
@@ -1158,34 +1446,15 @@ impl RealtimeClient {
 
 fn event_label(event: &Event) -> String {
     match event {
-        Event::Message => "Message".to_string(),
-        Event::Error => "Error".to_string(),
-        other => format!("Custom({other})"),
+        Event::Message => "reply".to_string(),
+        Event::Error => "ERROR".to_string(),
+        Event::Custom(name) => name.clone(),
     }
 }
 
 fn payload_label(payload: &Payload) -> String {
-    match payload {
-        Payload::Text(values) => format!("{values:?}"),
-        #[allow(deprecated)]
-        Payload::String(s) => format!("{s:?}"),
-        Payload::Binary(b) => format!("<{} bytes>", b.len()),
-    }
-}
-
-fn payload_text(payload: &Payload) -> String {
-    match payload {
-        Payload::Text(values) => values
-            .first()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .unwrap_or_default(),
-        #[allow(deprecated)]
-        Payload::String(s) => s.clone(),
-        Payload::Binary(_) => "<binary>".to_string(),
-    }
+    let Payload::Text(values) = payload;
+    format!("{values:?}")
 }
 
 /// Set `OGS_TUI_TRACE=1` (or `=all` to also dump the `active-bots` catalog)
@@ -1216,7 +1485,6 @@ fn is_auth_relevant(event: &Event) -> bool {
     match event {
         Event::Message | Event::Error => true,
         Event::Custom(name) => name != "active-bots",
-        _ => false,
     }
 }
 
@@ -1237,15 +1505,274 @@ mod tests {
             .insert(rid, command.to_string());
     }
 
+    /// A client with no socket whose outbound frames can be read back.
+    fn client() -> (RealtimeClient, UnboundedReceiver<RealtimeEvent>, UnboundedReceiver<Outbound>) {
+        let mut client = RealtimeClient::new("jwt".to_string());
+        let events = client.take_event_receiver().unwrap();
+        let outbound = client.inner.out_rx.lock().unwrap().take().unwrap();
+        (client, events, outbound)
+    }
+
+    fn drain(outbound: &mut UnboundedReceiver<Outbound>) -> Vec<(String, Value)> {
+        let mut frames = Vec::new();
+        while let Ok((command, payload, _rid)) = outbound.try_recv() {
+            let Payload::Text(values) = payload;
+            let data = values.into_iter().next().unwrap_or(Value::Null);
+            frames.push((command, data));
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn world_chat_joins_the_same_wire_room_before_sending() {
+        let (client, _events, mut outbound) = client();
+        let uuid = client.send_chat("en", "hello");
+        let frames = drain(&mut outbound);
+        assert_eq!(frames.len(), 2, "{frames:?}");
+        assert_eq!(frames[0].0, "chat/join");
+        assert_eq!(frames[0].1["channel"], "global-english");
+        assert_eq!(frames[1].0, "chat/send");
+        assert_eq!(frames[1].1["channel"], "global-english");
+        assert_eq!(frames[1].1["uuid"], uuid);
+        assert_eq!(frames[1].1["message"], "hello");
+
+        // Already joined: no second join.
+        client.send_chat("#EN", "again");
+        let frames = drain(&mut outbound);
+        assert_eq!(frames.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["chat/send"]);
+    }
+
+    #[test]
+    fn join_and_part_use_only_the_wire_name() {
+        let (client, _events, mut outbound) = client();
+        client.chat_join("zh");
+        client.chat_part("zh");
+        let frames = drain(&mut outbound);
+        assert_eq!(frames.len(), 2, "one frame each, no raw-name duplicate: {frames:?}");
+        assert!(frames.iter().all(|(_, data)| data["channel"] == "global-zh-hans"));
+        assert!(client.joined_channels().is_empty());
+    }
+
+    /// The next queued frame with its request id.
+    fn next_frame(outbound: &mut UnboundedReceiver<Outbound>) -> (String, Value, Option<u64>) {
+        let (command, payload, rid) = outbound.try_recv().expect("a queued frame");
+        let Payload::Text(values) = payload;
+        (command, values.into_iter().next().unwrap_or(Value::Null), rid)
+    }
+
+    #[tokio::test]
+    async fn chat_send_is_confirmed_by_the_servers_reply_not_an_echo() {
+        // Seen live: OGS answers `["chat/send", {...}, 5]` with `[5,null,null]`
+        // and never sends the line back to the sending socket.
+        let (client, mut events, mut outbound) = client();
+        client.chat_join("en");
+        let (command, _, rid) = next_frame(&mut outbound);
+        assert_eq!((command.as_str(), rid), ("chat/join", None));
+
+        client.send_chat("en", "hello");
+        let (command, data, rid) = next_frame(&mut outbound);
+        assert_eq!(command, "chat/send");
+        assert_eq!(data["message"], "hello");
+        let rid = rid.expect("chat/send carries a request id");
+
+        client.inner.handle_frame(&format!("[{rid},null,null]"));
+        assert!(client.inner.pending_chat.lock().unwrap().is_empty());
+        assert!(client.inner.pending.lock().unwrap().is_empty());
+        while let Ok(event) = events.try_recv() {
+            assert!(!matches!(event, RealtimeEvent::Error(_)), "{event:?}");
+        }
+
+        // A refusal names the channel and the server's reason.
+        client.send_chat("en", "again");
+        let (_, _, rid) = next_frame(&mut outbound);
+        let rid = rid.unwrap();
+        client
+            .inner
+            .handle_frame(&format!(r#"[{rid},null,{{"message":"you are muted"}}]"#));
+        let errors: Vec<String> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event {
+                RealtimeEvent::Error(message) => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            ["OGS refused the message to global-english: you are muted"]
+        );
+        assert!(client.inner.pending_chat.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn our_line_in_a_later_backlog_is_not_shown_twice_but_others_are() {
+        let (client, mut events, _outbound) = client();
+        client.inner.send_authenticated(&json!({"id": 1, "username": "me"}));
+        let _ = events.try_recv();
+        let uuid = client.send_chat("en", "hi all");
+
+        // After a rejoin OGS replays the backlog, our line included.
+        client.inner.dispatch(
+            Event::from("chat-message"),
+            Payload::Text(vec![json!({
+                "channel": "global-english", "id": 1, "username": "me",
+                "message": {"i": uuid, "m": "hi all", "t": 1}
+            })]),
+        );
+        assert!(events.try_recv().is_err(), "already shown locally");
+
+        // The same account posting from another device is a new line, and
+        // so is somebody else saying the same thing.
+        for (id, user, msg_id) in [(1, "me", "8vF9.web"), (2, "you", "x.1")] {
+            client.inner.dispatch(
+                Event::from("chat-message"),
+                Payload::Text(vec![json!({
+                    "channel": "global-english", "id": id, "username": user,
+                    "message": {"i": msg_id, "m": "hi all", "t": 2}
+                })]),
+            );
+            assert!(matches!(events.try_recv(), Ok(RealtimeEvent::Chat { .. })));
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_ids_follow_ogs_soft_uid_and_never_repeat() {
+        assert_eq!(base62(0), "0");
+        assert_eq!(base62(61), "z");
+        assert_eq!(base62(62), "10");
+        assert_eq!(base62(2_126_671), "8vF9");
+
+        let (client, mut events, _outbound) = client();
+        client
+            .inner
+            .send_authenticated(&json!({"id": 2_126_671, "username": "dream4u"}));
+        let _ = events.try_recv();
+        let first = client.send_chat("zh", "a");
+        let second = client.send_chat("zh", "b");
+        assert!(first.starts_with("8vF9."), "{first}");
+        assert!(second.starts_with("8vF9."), "{second}");
+        assert_ne!(first, second);
+        // Anchored to the clock rather than a per-process counter, so a
+        // restart cannot reuse an id that is still in the channel backlog.
+        let decode = |digits: &str| {
+            digits.chars().fold(0u64, |n, c| {
+                let digit = match c {
+                    '0'..='9' => c as u64 - '0' as u64,
+                    'A'..='Z' => c as u64 - 'A' as u64 + 10,
+                    _ => c as u64 - 'a' as u64 + 36,
+                };
+                n * 62 + digit
+            })
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let stamp = decode(first.trim_start_matches("8vF9."));
+        assert!(now_ms.abs_diff(stamp) < 60_000, "{first} is not epoch ms");
+        assert!(decode(second.trim_start_matches("8vF9.")) > stamp);
+    }
+
+    #[tokio::test]
+    async fn channels_are_rejoined_only_after_a_reconnect_authenticates() {
+        let (client, mut events, mut outbound) = client();
+        client.chat_join("en");
+        client.chat_join("ja");
+        drain(&mut outbound);
+
+        // First authentication: nothing to replay.
+        client.inner.send_authenticated(&json!({"id": 1, "username": "me"}));
+        assert!(drain(&mut outbound).is_empty());
+
+        // Reconnect: the new socket is unauthenticated until the server
+        // accepts the JWT again, and only then are channels rejoined.
+        client.inner.authenticated.store(false, Ordering::Relaxed);
+        assert!(drain(&mut outbound).is_empty());
+        client.inner.send_authenticated(&json!({"id": 1, "username": "me"}));
+        let rejoined: Vec<_> = drain(&mut outbound)
+            .into_iter()
+            .map(|(command, data)| (command, data["channel"].as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            rejoined,
+            [
+                ("chat/join".to_string(), "global-english".to_string()),
+                ("chat/join".to_string(), "global-japanese".to_string()),
+            ]
+        );
+        while events.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn frames_are_plain_json_arrays_like_goban() {
+        assert_eq!(
+            encode_frame("chat/join", Payload::Text(vec![json!({"channel": "global-english"})]), None),
+            r#"["chat/join",{"channel":"global-english"}]"#
+        );
+        assert_eq!(
+            encode_frame("authenticate", Payload::Text(vec![json!({"jwt": "x"})]), Some(3)),
+            r#"["authenticate",{"jwt":"x"},3]"#
+        );
+    }
+
+    #[test]
+    fn inbound_frames_are_split_into_replies_pushes_and_errors() {
+        let (inner, mut events) = inner();
+        seed(&inner, 1, "authenticate");
+        // What OGS answers to `["authenticate", {...}, 1]` (seen live).
+        inner.handle_frame(r#"[1,{"id":2126671,"username":"dream4u"},null]"#);
+        match events.try_recv().unwrap() {
+            RealtimeEvent::Authenticated { user_id, username } => {
+                assert_eq!((user_id, username.as_str()), (2126671, "dream4u"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(inner.is_authenticated());
+        let _ = events.try_recv(); // the Response event
+
+        inner.handle_frame(r#"["chat-message",{"channel":"global-english","id":5,"username":"sora","message":{"i":"a1","m":"hi","t":1}}]"#);
+        assert!(matches!(events.try_recv(), Ok(RealtimeEvent::Chat { .. })));
+
+        inner.handle_frame(r#"["ERROR","Invalid jwt"]"#);
+        match events.try_recv().unwrap() {
+            RealtimeEvent::Error(message) => assert_eq!(message, "server: Invalid jwt"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Garbage and non-array frames are ignored.
+        inner.handle_frame("not json");
+        inner.handle_frame(r#"{"x":1}"#);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn queued_frames_wait_for_a_connection_then_go_out_in_order() {
+        let mut client = RealtimeClient::new("jwt".to_string());
+        let _events = client.take_event_receiver().unwrap();
+        client.inner.start_outbound_worker();
+        client.chat_join("en");
+        client.inner.notify("net/ping", json!({}));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let (writer, mut wire) = unbounded_channel::<String>();
+        client.inner.link.send_replace(Some(writer));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), wire.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let second = wire.recv().await.unwrap();
+        assert_eq!(first, r#"["chat/join",{"channel":"global-english"}]"#);
+        assert!(second.starts_with(r#"["net/ping""#));
+        client.disconnect().await;
+    }
+
     #[test]
     fn request_carries_the_rid_in_the_third_position() {
         // goban: `cb ? [command, data, ++id] : [command, data]`
         let payload = Payload::Text(vec![json!({"game_id": 5}), json!(9)]);
         let wire = Value::Array(
             std::iter::once(Value::String("game/move".to_string()))
-                .chain(match payload {
-                    Payload::Text(values) => values,
-                    _ => unreachable!(),
+                .chain({
+                    let Payload::Text(values) = payload;
+                    values
                 })
                 .collect(),
         );
@@ -1257,9 +1784,9 @@ mod tests {
         let payload = Payload::Text(vec![json!({"channel": "general"})]);
         let wire = Value::Array(
             std::iter::once(Value::String("chat/join".to_string()))
-                .chain(match payload {
-                    Payload::Text(values) => values,
-                    _ => unreachable!(),
+                .chain({
+                    let Payload::Text(values) = payload;
+                    values
                 })
                 .collect(),
         );
@@ -1382,10 +1909,8 @@ mod tests {
     }
 
     #[test]
-    fn ogs_error_events_never_reach_on_any() {
-        // `Event::from` lowercases, so OGS's ["ERROR", ...] becomes
-        // Event::Error, which rust_socketio routes only to `on("error", ..)`.
-        // If this ever starts failing, the `on_any` dispatch could take ERROR.
+    fn error_frames_are_recognised_case_insensitively() {
+        // OGS sends ["ERROR", text]; it must not be mistaken for a push event.
         assert_eq!(Event::from("ERROR"), Event::Error);
         assert_eq!(Event::from("error"), Event::Error);
         assert!(matches!(Event::from("hostinfo"), Event::Custom(_)));

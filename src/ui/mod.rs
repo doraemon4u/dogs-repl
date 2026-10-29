@@ -1,11 +1,27 @@
 //! Presentation layer: command grammar, text REPL, and TUI.
 
 pub mod commands;
+pub mod new_game;
 pub mod repl;
 pub mod tui;
 
 use crate::transport::rest_client::{ChallengeClock, ChallengeOptions};
 use commands::{ChallengeClockSpec, ChallengeSpec};
+
+/// A 9×9 local game set up just before a ko: Black takes it at C2, and
+/// White's immediate retake at B2 is then illegal.
+pub fn preset_ko_command() -> crate::session::Command {
+    use crate::engine::coord::Coord;
+    let moves = [(1, 3), (2, 3), (0, 2), (1, 2), (1, 1), (3, 2), (6, 6), (2, 1)]
+        .into_iter()
+        .map(|(col, row)| Coord::new(col, row))
+        .collect();
+    crate::session::Command::NewLocalGame {
+        size: 9,
+        rules: crate::engine::rules::RuleSet::Chinese,
+        moves,
+    }
+}
 
 /// Converts the parsed challenge command into the Transport request body.
 pub fn challenge_options(spec: ChallengeSpec) -> ChallengeOptions {

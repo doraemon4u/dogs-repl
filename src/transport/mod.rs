@@ -1,4 +1,4 @@
-//! Transport layer: REST API and Realtime socket.io client.
+//! Transport layer: REST API and the Realtime WebSocket client.
 
 pub mod auth;
 pub mod realtime_client;

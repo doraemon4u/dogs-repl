@@ -5,12 +5,14 @@
 //! they arrive; the prompt is redrawn after updates.
 
 use crate::engine::board::Color;
-use crate::engine::estimate::{score, ScoringRules};
+use crate::engine::estimate::score;
 use crate::session::store::{ChatKind, ConnectionState, GamePhase, GameView, LogLevel, Store};
 use crate::session::{Command, SessionHandle};
 use crate::ui::commands::{
-    self, EstimateCommand, ScoreCommand, UndoCommand, UserCommand,
+    self, EstimateCommand, GameMode, NewGameSpec, ScoreCommand, SgfAction, UndoCommand,
+    UserCommand,
 };
+use crate::ui::new_game::{self, NewGameWizard, Outcome};
 use crate::ui::tui::{board_render, estimate_render};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
@@ -53,6 +55,10 @@ struct Repl {
     last_chat_channel: String,
     board_signature: Option<BoardSignature>,
     pending_login: Option<String>,
+    /// New Game flow waiting for the next numbered choice.
+    pending_new_game: Option<NewGameWizard>,
+    /// SGF import/export waiting for a typed path.
+    pending_sgf: Option<SgfAction>,
     pending_initial_game: Option<u64>,
     lobby_deadline: Option<Instant>,
     prompt_shown: bool,
@@ -69,6 +75,8 @@ impl Repl {
             last_chat_channel: String::new(),
             board_signature: None,
             pending_login: None,
+            pending_new_game: None,
+            pending_sgf: None,
             pending_initial_game: options.initial_game,
             lobby_deadline: None,
             prompt_shown: false,
@@ -89,18 +97,16 @@ impl Repl {
                  or wait for a saved session to resume."
             ),
         }
-        println!(
-            "world #{}, board {}x{} coordinate syntax [a10]\n",
-            store.world_channel,
-            store
-                .focused_game()
-                .map(|game| game.size)
-                .unwrap_or(19),
-            store
-                .focused_game()
-                .map(|game| game.size)
-                .unwrap_or(19)
-        );
+        match store.focused_game() {
+            Some(game) => println!(
+                "world #{}, board {}x{} · coordinate syntax [a10]\n",
+                store.world_channel, game.size, game.size
+            ),
+            None => println!(
+                "world #{} · no game open: `new` starts one (9/13/19, vs AI or 摆谱)\n",
+                store.world_channel
+            ),
+        }
         // Show a little history, then treat it as already seen.
         let current = store.current_chat_channel();
         if let Some(channel) = store.channels.get(&current) {
@@ -233,7 +239,9 @@ impl Repl {
             game.phase.label(),
             game.our_color
                 .map(|color| format!("you are {color:?}"))
-                .unwrap_or_else(|| "spectating".to_string()),
+                .unwrap_or_else(|| {
+                    if game.local { "摆谱 both colors" } else { "spectating" }.to_string()
+                }),
             game.size,
             game.size,
             game.komi,
@@ -243,9 +251,12 @@ impl Repl {
     }
 
     fn print_prompt(&mut self, store: &Store) {
-        if let Some(username) = &self.pending_login {
-            let _ = username;
+        if self.pending_login.is_some() {
             print!("password> ");
+        } else if let Some(action) = self.pending_sgf {
+            print!("{} (blank cancels)> ", action.prompt());
+        } else if self.pending_new_game.is_some() {
+            print!("new game (number, `b` back, blank cancels)> ");
         } else {
             let game_id = store.active_game.or_else(|| store.chat_scope.game_id());
             let estimate = store
@@ -270,8 +281,89 @@ impl Repl {
             println!("[..] signing in…");
             return true;
         }
+        if let Some(action) = self.pending_sgf.take() {
+            return match action.with_path(&line) {
+                Some(command) => self.dispatch(command).await,
+                None => {
+                    println!("[i] SGF {} cancelled", match action {
+                        SgfAction::Load => "import",
+                        SgfAction::Save => "export",
+                    });
+                    true
+                }
+            };
+        }
+        if let Some(mut wizard) = self.pending_new_game.take() {
+            let answer = line.trim();
+            if answer.is_empty() {
+                println!("[i] new game cancelled");
+                return true;
+            }
+            if answer.eq_ignore_ascii_case("b") {
+                if !wizard.back() {
+                    println!("[i] new game cancelled");
+                    return true;
+                }
+            } else {
+                match answer.parse::<usize>() {
+                    Ok(number) if number >= 1 => match wizard.choose(number - 1) {
+                        Outcome::Done(spec) => {
+                            self.start_new_game(&spec).await;
+                            return true;
+                        }
+                        Outcome::Blocked(reason) => println!("[!] {reason}"),
+                        Outcome::Next => {}
+                    },
+                    // Anything else is a normal command: leave the menu.
+                    _ => {
+                        println!("[i] new game cancelled");
+                        let command = commands::parse(&line);
+                        return self.dispatch(command).await;
+                    }
+                }
+            }
+            print_wizard(&wizard);
+            self.pending_new_game = Some(wizard);
+            return true;
+        }
         let command = commands::parse(&line);
         self.dispatch(command).await
+    }
+
+    async fn open_new_game(&mut self, spec: NewGameSpec) {
+        let store = self.session.snapshot().await;
+        if spec.mode == Some(GameMode::VsAi) && store.username.is_none() {
+            println!("[!] vs AI needs a logged-in OGS account (`login <user>`); `new local` plays offline");
+            return;
+        }
+        let wizard =
+            NewGameWizard::new(spec, store.username.is_some(), store.online_bots.clone());
+        if wizard.step().is_none() {
+            self.start_new_game(&wizard.spec).await;
+            return;
+        }
+        print_wizard(&wizard);
+        self.pending_new_game = Some(wizard);
+    }
+
+    async fn start_new_game(&mut self, spec: &NewGameSpec) {
+        let store = self.session.snapshot().await;
+        if spec.mode == Some(GameMode::VsAi) && store.username.is_none() {
+            println!("[!] vs AI needs a logged-in OGS account (`login <user>`)");
+            return;
+        }
+        match new_game::start_command(spec, &store.online_bots) {
+            Ok(command) => {
+                if let Command::CreateChallenge(options) = &command {
+                    println!(
+                        "[..] challenging {} ({}x{}, {}, unranked)…",
+                        options.opponent, options.board_size, options.board_size, options.rules
+                    );
+                }
+                self.session.send(command);
+            }
+            Err(error) => println!("[!] {error}"),
+        }
     }
 
     async fn dispatch(&mut self, command: UserCommand) -> bool {
@@ -327,7 +419,16 @@ impl Repl {
             UserCommand::Focus(_) => println!(
                 "[i] focus panes are a TUI concept; the REPL prints panes sequentially"
             ),
-            UserCommand::Score(ScoreCommand::Show) => print_score(&store),
+            UserCommand::Score(ScoreCommand::Show) => {
+                print_score(&store);
+                if let Some(game) = store.focused_game() {
+                    if game.local && !game.estimate_active {
+                        if let Some(game_id) = game_id {
+                            self.session.send(Command::EstimateAuto { game_id });
+                        }
+                    }
+                }
+            }
             UserCommand::Score(ScoreCommand::Accept) => match game_id {
                 Some(game_id) => self.session.send(Command::OfficialAccept { game_id }),
                 None => println!("[!] no game open"),
@@ -425,25 +526,17 @@ impl Repl {
                 Some(game_id) => self.session.send(Command::CloseGame(game_id)),
                 None => println!("[!] no game open"),
             },
-            UserCommand::BoardSize(size) => {
-                self.session.send(Command::SetBoardSize { game_id, size });
-            }
+            UserCommand::NewGame(spec) => self.open_new_game(spec).await,
             UserCommand::PresetKo => {
-                let gid = game_id.unwrap_or(42);
-                self.session
-                    .send(Command::SetBoardSize { game_id: Some(gid), size: 9 });
-                let demo_moves = [
-                    crate::engine::coord::Coord::new(1, 9),
-                    crate::engine::coord::Coord::new(2, 8),
-                    crate::engine::coord::Coord::new(0, 8),
-                    crate::engine::coord::Coord::new(1, 7),
-                    crate::engine::coord::Coord::new(1, 8),
-                    crate::engine::coord::Coord::new(0, 9),
-                ];
-                for coord in demo_moves {
-                    self.session.send(Command::PlayMove { game_id: gid, coord });
+                self.session.send(crate::ui::preset_ko_command());
+                println!("[i] Preset: a ko at the lower left. Black to play — take it with [c2].");
+            }
+            UserCommand::PromptSgfPath(action) => {
+                if action == SgfAction::Save && game_id.is_none() {
+                    println!("[!] no game open");
+                } else {
+                    self.pending_sgf = Some(action);
                 }
-                println!("[i] Preset: Ko shape ready at A8/A9. Try capturing [a8]!");
             }
             UserCommand::LoadSgf(game_id) => {
                 self.session.send(Command::LoadSgf(game_id));
@@ -566,12 +659,51 @@ fn print_lobby(store: &Store) {
     }
 }
 
+fn print_wizard(wizard: &NewGameWizard) {
+    let Some(step) = wizard.step() else { return };
+    let summary = wizard.summary();
+    if summary.is_empty() {
+        println!("New Game — {}", step.title());
+    } else {
+        println!("New Game [{summary}] — {}", step.title());
+    }
+    for (index, choice) in wizard.choices().iter().enumerate() {
+        match &choice.disabled {
+            Some(reason) => println!("  {}. {} ({reason})", index + 1, choice.label),
+            None => println!("  {}. {}", index + 1, choice.label),
+        }
+    }
+}
+
 fn print_score(store: &Store) {
     let Some(game) = store.focused_game() else {
         println!("[!] no game open");
         return;
     };
     println!("{}", game.title());
+    if game.local {
+        if !game.estimate_active {
+            println!("[..] detecting dead stones; the result follows in the log");
+        }
+        let dead = if game.estimate_active {
+            game.estimate_dead.clone()
+        } else {
+            Default::default()
+        };
+        let snapshot = game.active_game_ref();
+        let summary = score(
+            game.board(),
+            &dead,
+            game.komi,
+            game.rule_set(),
+            (snapshot.captures(Color::Black), snapshot.captures(Color::White)),
+        );
+        println!("规则 {} · komi {}", game.rule_set().label(), game.komi);
+        println!("count: {summary}");
+        println!("{}", summary.breakdown());
+        println!("Toggle dead groups with [a10] in `estimate` mode; `undo` resumes play.");
+        return;
+    }
     println!("phase: {}", game.phase.label());
     if !game.scoring_dead.is_empty() {
         let mut coords: Vec<_> = game.scoring_dead.iter().copied().collect();
@@ -590,7 +722,7 @@ fn print_score(store: &Store) {
         game.board(),
         &game.scoring_dead,
         game.komi,
-        ScoringRules::from_ogs(&game.rules),
+        game.rule_set(),
         (
             game.game.captures(Color::Black),
             game.game.captures(Color::White),

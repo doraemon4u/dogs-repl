@@ -3,7 +3,9 @@
 use crate::session::store::{
     ChatKind, ChatScope, ConnectionState, GameView, LogLevel, Store,
 };
+use crate::ui::new_game::NewGameWizard;
 use crate::ui::tui::board_render;
+use crate::ui::tui::input::InputState;
 use crate::ui::tui::theme::Theme;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -61,42 +63,53 @@ pub struct HeaderAction {
     pub key: &'static str,
     pub cmd: &'static str,
     pub active: bool,
+    /// Draw a `│` separator before this button.
+    pub group_start: bool,
 }
 
-pub fn header_actions(current_size: u8, estimate_active: bool) -> Vec<HeaderAction> {
+/// Header buttons. Board size is not here: it is chosen inside New Game.
+pub fn header_actions(estimate_active: bool) -> Vec<HeaderAction> {
+    let action = |label, key, cmd, active, group_start| HeaderAction {
+        label,
+        key,
+        cmd,
+        active,
+        group_start,
+    };
     vec![
-        HeaderAction { label: "9×9", key: "F1", cmd: "size 9", active: current_size == 9 },
-        HeaderAction { label: "13×13", key: "F2", cmd: "size 13", active: current_size == 13 },
-        HeaderAction { label: "19×19", key: "F3", cmd: "size 19", active: current_size == 19 },
-        HeaderAction { label: "打劫死眼", key: "F4", cmd: "preset ko", active: false },
-        HeaderAction { label: "形势判断", key: "F5", cmd: "estimate auto", active: estimate_active },
-        HeaderAction { label: "退出形势", key: "F6", cmd: "estimate exit", active: false },
-        HeaderAction { label: "悔棋", key: "F7", cmd: "prev", active: false },
-        HeaderAction { label: "前进", key: "F8", cmd: "next", active: false },
-        HeaderAction { label: "频道", key: "F9", cmd: "channels", active: false },
-        HeaderAction { label: "帮助", key: "F10", cmd: "help", active: false },
+        action("新对局", "F1", "new", false, false),
+        action("打劫死眼", "F4", "preset ko", false, true),
+        action("形势判断", "F5", "estimate auto", estimate_active, true),
+        action("退出形势", "F6", "estimate exit", false, false),
+        action("悔棋", "F7", "prev", false, true),
+        action("前进", "F8", "next", false, false),
+        action("频道", "F9", "channels", false, true),
+        action("帮助", "F10", "help", false, false),
     ]
 }
 
+const HEADER_PREFIX: &str = " ● ogs-tui ";
+
+fn header_button(action: &HeaderAction) -> String {
+    format!(" [{}:{}]", action.key, action.label)
+}
+
 /// Top quick actions button bar (matches the web preview).
-pub fn draw_header(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    current_size: u8,
-    estimate_active: bool,
-) {
+pub fn draw_header(frame: &mut Frame, area: Rect, theme: &Theme, estimate_active: bool) {
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::styled(" ● ogs-tui ", Style::default().fg(theme.board).add_modifier(Modifier::BOLD)));
-    spans.push(Span::styled("│", Style::default().fg(theme.dim(theme.board))));
-
-    let actions = header_actions(current_size, estimate_active);
-    for (i, action) in actions.iter().enumerate() {
-        if i == 3 || i == 4 || i == 6 || i == 8 {
-            spans.push(Span::styled("│", Style::default().fg(theme.dim(theme.board))));
+    let separator = || Span::styled("│", Style::default().fg(theme.dim(theme.board)));
+    let mut spans: Vec<Span> = vec![
+        Span::styled(
+            HEADER_PREFIX,
+            Style::default().fg(theme.board).add_modifier(Modifier::BOLD),
+        ),
+        separator(),
+    ];
+    for action in header_actions(estimate_active) {
+        if action.group_start {
+            spans.push(separator());
         }
         let style = if action.active {
             Style::default()
@@ -105,38 +118,118 @@ pub fn draw_header(
         } else {
             Style::default().fg(theme.accent)
         };
-        spans.push(Span::styled(format!(" [{}:{}]", action.key, action.label), style));
+        spans.push(Span::styled(header_button(&action), style));
     }
-
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Hit-tests a mouse click on the top header bar to identify the corresponding command.
+/// Hit-tests a mouse click on the top header bar, using the same widths
+/// `draw_header` lays out (display width, so CJK labels count as 2).
 pub fn header_action_at(
     click_x: u16,
     click_y: u16,
     area: Rect,
-    current_size: u8,
     estimate_active: bool,
 ) -> Option<&'static str> {
+    use unicode_width::UnicodeWidthStr;
     if area.width == 0 || area.height == 0 || click_y != area.y {
         return None;
     }
-    let mut cur_x = area.x;
-    // Prefix " ● ogs-tui │" has 13 chars
-    cur_x += 13;
-    let actions = header_actions(current_size, estimate_active);
-    for (i, action) in actions.iter().enumerate() {
-        if i == 3 || i == 4 || i == 6 || i == 8 {
+    let mut cur_x = area.x + HEADER_PREFIX.width() as u16 + 1;
+    for action in header_actions(estimate_active) {
+        if action.group_start {
             cur_x += 1;
         }
-        let btn_len = (format!(" [{}:{}]", action.key, action.label)).chars().count() as u16;
-        if click_x >= cur_x && click_x < cur_x + btn_len {
+        let width = header_button(&action).width() as u16;
+        if click_x >= cur_x && click_x < cur_x + width {
             return Some(action.cmd);
         }
-        cur_x += btn_len;
+        cur_x += width;
     }
     None
+}
+
+/// Draws the New Game flow as a centred list.
+pub fn draw_new_game(frame: &mut Frame, area: Rect, wizard: &NewGameWizard, theme: &Theme) {
+    let Some(step) = wizard.step() else { return };
+    let choices = wizard.choices();
+    let height = (choices.len() as u16 + 7).min(area.height);
+    let width = 64.min(area.width);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = pane_block(&format!("新对局 New Game — {}", step.title()), theme.accent, theme, true);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let summary = wizard.summary();
+    let mut lines = vec![Line::from(Span::styled(
+        if summary.is_empty() { " ".to_string() } else { summary },
+        Style::default().fg(theme.muted),
+    ))];
+    lines.push(Line::from(""));
+    for (index, choice) in choices.iter().enumerate() {
+        let selected = index == wizard.selected;
+        let cursor = if selected { "▶ " } else { "  " };
+        let text = match &choice.disabled {
+            Some(reason) => format!("{cursor}{}. {}  ({reason})", index + 1, choice.label),
+            None => format!("{cursor}{}. {}", index + 1, choice.label),
+        };
+        let style = if choice.disabled.is_some() {
+            Style::default().fg(theme.muted)
+        } else if selected {
+            Style::default()
+                .fg(theme.focus(theme.board))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.accent)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑/↓ or 1–9 choose · Enter confirm · Backspace back · Esc cancel",
+        Style::default().fg(theme.muted),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Draws a one-line path entry box.
+pub fn draw_path_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    input: &InputState,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    let width = 72.min(area.width);
+    let height = 6.min(area.height);
+    let rect = Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = pane_block(title, theme.accent, theme, true);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("path> ", Style::default().fg(theme.muted)),
+            Span::styled(input.buffer(), Style::default().fg(theme.accent)),
+            Span::styled("▏", Style::default().fg(theme.focus(theme.board))),
+        ]),
+        Line::from(Span::styled(
+            error.unwrap_or("Enter confirm · Esc cancel · ~/ expands to your home"),
+            Style::default().fg(if error.is_some() { theme.error } else { theme.muted }),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Top status bar.
@@ -290,7 +383,7 @@ pub fn draw_login(
         Line::from(Span::styled(message, Style::default().fg(theme.warning))),
         Line::from(""),
         Line::from(Span::styled(
-            "Tab: next field · Enter: submit · Ctrl+C: quit",
+            "Tab: next field · Enter: submit · F1: 摆谱 offline · Ctrl+C: quit",
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(
@@ -540,6 +633,7 @@ pub fn draw_moves(
     let our = match game.our_color {
         Some(crate::engine::board::Color::Black) => "you are Black",
         Some(crate::engine::board::Color::White) => "you are White",
+        None if game.local => "摆谱 both colors",
         None => "spectating",
     };
     lines.push(Line::from(vec![
@@ -1086,6 +1180,100 @@ pub fn chat_title(store: &Store) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn header_has_no_board_size_buttons_and_clicks_line_up() {
+        use unicode_width::UnicodeWidthStr;
+        let actions = header_actions(false);
+        assert!(actions.iter().all(|action| !action.cmd.starts_with("size")));
+        assert_eq!(actions[0].cmd, "new");
+
+        // Re-create the drawn line and click the middle of every button.
+        let area = Rect::new(0, 0, 200, 1);
+        let mut x = HEADER_PREFIX.width() as u16 + 1;
+        for action in &actions {
+            if action.group_start {
+                x += 1;
+            }
+            let width = header_button(action).width() as u16;
+            assert_eq!(header_action_at(x + width / 2, 0, area, false), Some(action.cmd));
+            x += width;
+        }
+        assert_eq!(header_action_at(x + 2, 0, area, false), None);
+        assert_eq!(header_action_at(2, 0, area, false), None, "prefix is not a button");
+    }
+
+    #[test]
+    fn new_game_overlay_and_path_prompt_render_their_content() {
+        use crate::ui::commands::NewGameSpec;
+        use crate::ui::tui::theme::ColorSupport;
+        use ratatui::{backend::TestBackend, Terminal};
+        let theme = Theme::new(ColorSupport::TrueColor);
+        let text = |terminal: &Terminal<TestBackend>| -> String {
+            let buffer = terminal.backend().buffer();
+            (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .map(|x| buffer[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut terminal = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        let wizard = NewGameWizard::new(NewGameSpec::default(), false, Vec::new());
+        terminal
+            .draw(|frame| draw_new_game(frame, frame.area(), &wizard, &theme))
+            .unwrap();
+        let screen = text(&terminal);
+        assert!(screen.contains("New Game"), "{screen}");
+        assert!(screen.contains("9×9") && screen.contains("13×13") && screen.contains("19×19"));
+        assert!(screen.contains("▶ 1. 9×9"));
+
+        let mut input = InputState::new();
+        input.insert_str("~/games/a.sgf");
+        terminal
+            .draw(|frame| draw_path_prompt(frame, frame.area(), "save SGF to", &input, None, &theme))
+            .unwrap();
+        let screen = text(&terminal);
+        assert!(screen.contains("save SGF to"));
+        assert!(screen.contains("path> ~/games/a.sgf"));
+    }
+
+    #[test]
+    fn every_board_size_renders_inside_its_own_pane() {
+        use crate::session::store::GameView;
+        use crate::ui::tui::theme::ColorSupport;
+        use ratatui::buffer::Buffer;
+        let theme = Theme::new(ColorSupport::TrueColor);
+        for size in [9u8, 13, 19] {
+            let mut game = GameView::local(1, size, crate::engine::rules::RuleSet::Chinese);
+            game.game.play(crate::engine::coord::Coord::new(0, 1)).unwrap();
+            let screen = Rect::new(0, 0, 130, 42);
+            let layout = crate::ui::tui::layout::split_game(screen, size);
+            let inner = Rect::new(
+                layout.board.x + 1,
+                layout.board.y + 1,
+                layout.board.width - 2,
+                layout.board.height - 2,
+            );
+            let mut buf = Buffer::empty(screen);
+            board_render::draw_board(&mut buf, inner, &game, &theme, true);
+            let drawn: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(!drawn.contains("too small"), "{size}x{size} fits its pane");
+            // The last column letter and the top row number are both visible.
+            let last_letter = crate::engine::board::Board::letter_for_col(size - 1).unwrap();
+            assert!(drawn.contains(last_letter), "{size}: column {last_letter}");
+            assert!(drawn.contains(&size.to_string()), "{size}: top row label");
+            // Nothing is drawn into the side column.
+            for y in 0..screen.height {
+                for x in layout.moves.x..screen.width {
+                    assert_eq!(buf[(x, y)].symbol(), " ", "{size}: leaked at {x},{y}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn overlay_scroll_is_clamped() {

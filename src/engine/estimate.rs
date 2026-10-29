@@ -26,23 +26,31 @@ pub enum PointEstimate {
     DeadStone(Color),
 }
 
-/// Scoring system used by [`score`].
+pub use super::rules::RuleSet;
+
+/// How a [`RuleSet`] counts a finished game.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScoringRules {
-    /// Chinese-style area scoring: stones + surrounded territory + komi.
+pub enum ScoringMethod {
+    /// 数子: living stones + surrounded points.
     Area,
-    /// Japanese-style territory scoring: territory + prisoners + komi.
+    /// 数目: surrounded points + prisoners.
     Territory,
 }
 
-impl ScoringRules {
-    /// Parses the `rules` string OGS sends (`chinese`, `japanese`, ...).
-    pub fn from_ogs(rules: &str) -> Self {
-        let lower = rules.to_ascii_lowercase();
-        if lower.contains("japanese") || lower.contains("korean") {
-            Self::Territory
-        } else {
-            Self::Area
+impl RuleSet {
+    pub const fn scoring_method(self) -> ScoringMethod {
+        match self {
+            Self::JapaneseKorean => ScoringMethod::Territory,
+            Self::Chinese | Self::AncientChinese => ScoringMethod::Area,
+        }
+    }
+
+    /// Points each living group costs its owner (还棋头). Only ancient
+    /// Chinese rules charge it.
+    pub const fn group_tax(self) -> u32 {
+        match self {
+            Self::AncientChinese => 2,
+            Self::Chinese | Self::JapaneseKorean => 0,
         }
     }
 }
@@ -50,7 +58,7 @@ impl ScoringRules {
 /// A counted score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScoreSummary {
-    pub rules: ScoringRules,
+    pub rules: RuleSet,
     pub black_territory: u32,
     pub white_territory: u32,
     pub dame: u32,
@@ -62,6 +70,9 @@ pub struct ScoreSummary {
     pub captures_black: u32,
     /// Stones captured by White (Black prisoners).
     pub captures_white: u32,
+    /// Independent living groups, for the 还棋头 tax.
+    pub black_groups: u32,
+    pub white_groups: u32,
     pub komi: f64,
     pub black_points: f64,
     pub white_points: f64,
@@ -84,19 +95,51 @@ impl ScoreSummary {
             format!("W+{:.1}", -margin)
         }
     }
+
+    /// One line describing how the points were counted, for the UI.
+    pub fn breakdown(&self) -> String {
+        match self.rules.scoring_method() {
+            ScoringMethod::Area => {
+                let mut text = format!(
+                    "数子 B {} stones + {} pts, W {} stones + {} pts",
+                    self.black_stones, self.black_territory, self.white_stones, self.white_territory
+                );
+                if self.dame > 0 {
+                    text.push_str(&format!(", {} dame split", self.dame));
+                }
+                if self.rules.group_tax() > 0 {
+                    text.push_str(&format!(
+                        ", 还棋头 B {}×{} W {}×{}",
+                        self.black_groups,
+                        self.rules.group_tax(),
+                        self.white_groups,
+                        self.rules.group_tax()
+                    ));
+                }
+                text
+            }
+            ScoringMethod::Territory => format!(
+                "数目 B {} pts + {} prisoners, W {} pts + {} prisoners",
+                self.black_territory,
+                self.captures_black + self.dead_white,
+                self.white_territory,
+                self.captures_white + self.dead_black
+            ),
+        }
+    }
 }
 
 impl std::fmt::Display for ScoreSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}  B {:.1} : W {:.1}  (B territory {}, W territory {}, dame {}, dead B/W {}/{})",
+            "{}  B {:.1} : W {:.1}  [{}] ({}, komi {}, dead B/W {}/{})",
             self.result(),
             self.black_points,
             self.white_points,
-            self.black_territory,
-            self.white_territory,
-            self.dame,
+            self.rules.label(),
+            self.breakdown(),
+            self.komi,
             self.dead_black,
             self.dead_white
         )
@@ -238,16 +281,25 @@ fn ownership_counts(board: &Board, dead: &HashSet<(u8, u16)>) -> OwnershipCounts
     counts
 }
 
-/// Counts the current position.
+/// Counts the current position under `rules`.
 ///
 /// `captures` is `(black_captures, white_captures)`, i.e. stones captured by
 /// each color. Dead stones are removed before counting; under territory
 /// scoring they become prisoners for the opponent.
+///
+/// * Chinese (数子): living stones + surrounded points. Neutral points that
+///   were not filled in are shared, half to each side, which is what filling
+///   them alternately would produce.
+/// * Japanese/Korean (数目): surrounded points + prisoners. Neutral points are
+///   worth nothing, so filling them changes nothing.
+/// * Ancient Chinese (古法): Chinese counting, then each side gives back
+///   [`RuleSet::group_tax`] points for every independent living group
+///   (还棋头). No komi by default.
 pub fn score(
     board: &Board,
     dead: &HashSet<(u8, u16)>,
     komi: f64,
-    rules: ScoringRules,
+    rules: RuleSet,
     captures: (u16, u16),
 ) -> ScoreSummary {
     let estimates = estimate_with_dead(board, dead);
@@ -275,13 +327,21 @@ pub fn score(
     let counts = ownership_counts(board, dead);
     let (black_territory, white_territory, dame) =
         (counts.black, counts.white, counts.dame);
+    let (black_groups, white_groups) = living_group_counts(board, dead);
 
-    let (black_points, white_points) = match rules {
-        ScoringRules::Area => (
-            f64::from(black_stones + black_territory),
-            f64::from(white_stones + white_territory) + komi,
-        ),
-        ScoringRules::Territory => {
+    let (black_points, white_points) = match rules.scoring_method() {
+        ScoringMethod::Area => {
+            let share = f64::from(dame) / 2.0;
+            let tax = f64::from(rules.group_tax());
+            (
+                f64::from(black_stones + black_territory) + share
+                    - tax * f64::from(black_groups),
+                f64::from(white_stones + white_territory) + share
+                    - tax * f64::from(white_groups)
+                    + komi,
+            )
+        }
+        ScoringMethod::Territory => {
             let black_prisoners = u32::from(captures.0) + dead_white;
             let white_prisoners = u32::from(captures.1) + dead_black;
             (
@@ -302,10 +362,85 @@ pub fn score(
         dead_white,
         captures_black: u32::from(captures.0),
         captures_white: u32::from(captures.1),
+        black_groups,
+        white_groups,
         komi,
         black_points,
         white_points,
     }
+}
+
+/// Counts each side's independent living groups (棋头).
+///
+/// Solidly connected strings are one group. Strings of one color that border
+/// the same region of that color's territory share eyes, so they live
+/// together and also count as one group.
+pub fn living_group_counts(board: &Board, dead: &HashSet<(u8, u16)>) -> (u32, u32) {
+    let size = board.size();
+    let n = size as usize;
+    let index = |col: u8, row: u16| (row as usize - 1) * n + col as usize;
+    let mut parent: Vec<usize> = (0..n * n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    let union = |parent: &mut [usize], a: usize, b: usize| {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    };
+    let live = |col: u8, row: u16| board.get(col, row).filter(|_| !dead.contains(&(col, row)));
+
+    // Solid connections.
+    for row in 1..=size as u16 {
+        for col in 0..size {
+            let Some(color) = live(col, row) else { continue };
+            for (nc, nr) in board.neighbors(col, row) {
+                if live(nc, nr) == Some(color) {
+                    union(&mut parent, index(col, row), index(nc, nr));
+                }
+            }
+        }
+    }
+
+    // Strings sharing one single-owner region.
+    let mut visited = vec![vec![false; n]; n];
+    for row in 1..=size as u16 {
+        for col in 0..size {
+            if visited[row as usize - 1][col as usize] || live(col, row).is_some() {
+                continue;
+            }
+            let (region, boundary) = flood_fill(board, dead, col, row, &mut visited);
+            let [owner] = boundary.as_slice() else { continue };
+            let mut first: Option<usize> = None;
+            for &(rc, rr) in &region {
+                for (nc, nr) in board.neighbors(rc, rr) {
+                    if live(nc, nr) == Some(*owner) {
+                        let idx = index(nc, nr);
+                        match first {
+                            Some(root) => union(&mut parent, root, idx),
+                            None => first = Some(idx),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut roots: [HashSet<usize>; 2] = [HashSet::new(), HashSet::new()];
+    for row in 1..=size as u16 {
+        for col in 0..size {
+            if let Some(color) = live(col, row) {
+                let root = find(&mut parent, index(col, row));
+                roots[usize::from(color == Color::White)].insert(root);
+            }
+        }
+    }
+    (roots[0].len() as u32, roots[1].len() as u32)
 }
 
 /// Returns the connected group of same-colored stones containing `coord`.
@@ -453,29 +588,17 @@ fn run_playout(board: &Board, start_color: Color, rng: &mut Xorshift64) -> Board
             }
         }
 
-        // Shuffle candidate order with Fisher-Yates so the first legal non-eye
-        // move is chosen uniformly, while preferring immediate captures when available.
+        // Shuffle candidate order with Fisher-Yates, then take a capture if
+        // there is one, else the first legal non-eye move. Legality comes
+        // from one group/liberty table per move rather than trial-playing
+        // each point, which kept 19×19 counting under a second.
         let len = empty_points.len();
         for idx in 0..len {
             let swap_idx = idx + (rng.next_u64() as usize % (len - idx));
             empty_points.swap(idx, swap_idx);
         }
 
-        let mut chosen: Option<(u8, u16)> = None;
-        for &(col, row) in &empty_points {
-            if is_true_eye(&sim, col, row, color) {
-                continue;
-            }
-            if let Ok(captures) = rules::validate_move(&sim, col, row, color, ko_point) {
-                if captures > 0 {
-                    chosen = Some((col, row));
-                    break;
-                }
-                if chosen.is_none() {
-                    chosen = Some((col, row));
-                }
-            }
-        }
+        let chosen = pick_playout_move(&sim, color, &empty_points, ko_point);
 
         if let Some((col, row)) = chosen {
             let captured = rules::execute_move(&mut sim, col, row, color);
@@ -501,6 +624,111 @@ fn run_playout(board: &Board, start_color: Color, rng: &mut Xorshift64) -> Board
     }
 
     sim
+}
+
+/// Every group on the board with its liberty count, computed in one pass so a
+/// playout can test all candidate moves without re-flooding groups.
+struct GroupTable {
+    /// Group number per point (`u32::MAX` for empty points).
+    group: Vec<u32>,
+    liberties: Vec<u32>,
+}
+
+impl GroupTable {
+    fn build(board: &Board) -> Self {
+        let size = board.size();
+        let n = size as usize;
+        let index = |c: u8, r: u16| (r as usize - 1) * n + c as usize;
+        let mut group = vec![u32::MAX; n * n];
+        let mut liberties = Vec::new();
+        let mut liberty_mark = vec![u32::MAX; n * n];
+        let mut stack = Vec::new();
+        for row in 1..=size as u16 {
+            for col in 0..size {
+                let start = index(col, row);
+                let Some(color) = board.get(col, row) else { continue };
+                if group[start] != u32::MAX {
+                    continue;
+                }
+                let id = liberties.len() as u32;
+                let mut count = 0u32;
+                group[start] = id;
+                stack.push((col, row));
+                while let Some((c, r)) = stack.pop() {
+                    for (nc, nr) in board.neighbors(c, r) {
+                        let idx = index(nc, nr);
+                        match board.get(nc, nr) {
+                            None if liberty_mark[idx] != id => {
+                                liberty_mark[idx] = id;
+                                count += 1;
+                            }
+                            Some(other) if other == color && group[idx] == u32::MAX => {
+                                group[idx] = id;
+                                stack.push((nc, nr));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                liberties.push(count);
+            }
+        }
+        Self { group, liberties }
+    }
+
+    fn libs_at(&self, n: usize, col: u8, row: u16) -> u32 {
+        self.liberties[self.group[(row as usize - 1) * n + col as usize] as usize]
+    }
+
+    /// `(legal, captures)` for `color` at the empty point `(col, row)`:
+    /// it captures any adjacent opponent group with one liberty, and is
+    /// legal if it captures, touches an empty point, or joins a friendly
+    /// group that keeps another liberty.
+    fn classify(&self, board: &Board, col: u8, row: u16, color: Color) -> (bool, bool) {
+        let n = board.size() as usize;
+        let mut breathes = false;
+        let mut captures = false;
+        for (nc, nr) in board.neighbors(col, row) {
+            match board.get(nc, nr) {
+                None => breathes = true,
+                Some(other) => {
+                    let libs = self.libs_at(n, nc, nr);
+                    if other == color {
+                        breathes |= libs > 1;
+                    } else if libs == 1 {
+                        captures = true;
+                    }
+                }
+            }
+        }
+        (breathes || captures, captures)
+    }
+}
+
+/// Picks a playout move for `color`: a capture if one exists, otherwise the
+/// first legal move that does not fill one of `color`'s own eyes, in the
+/// (already shuffled) order of `empty_points`.
+fn pick_playout_move(
+    board: &Board,
+    color: Color,
+    empty_points: &[(u8, u16)],
+    ko_point: Option<(u8, u16)>,
+) -> Option<(u8, u16)> {
+    let table = GroupTable::build(board);
+    let mut fallback = None;
+    for &(col, row) in empty_points {
+        if ko_point == Some((col, row)) {
+            continue;
+        }
+        let (legal, captures) = table.classify(board, col, row, color);
+        if captures {
+            return Some((col, row));
+        }
+        if legal && fallback.is_none() && !is_true_eye(board, col, row, color) {
+            fallback = Some((col, row));
+        }
+    }
+    fallback
 }
 
 /// Checks whether `(col, row)` is a single-point eye for `color` that should
@@ -633,7 +861,7 @@ mod tests {
         let dead = dead(&[(4, 8)]);
         let result = estimate_with_dead(&board, &dead);
         assert_eq!(result[1][4], PointEstimate::DeadStone(Color::White));
-        let summary = score(&board, &dead, 0.0, ScoringRules::Area, (0, 0));
+        let summary = score(&board, &dead, 0.0, RuleSet::Chinese, (0, 0));
         assert_eq!(summary.dead_white, 1);
         assert_eq!(summary.dead_black, 0);
         // The dead stone's point belongs to Black's region.
@@ -647,7 +875,7 @@ mod tests {
             board.place(col, 9, Color::Black);
         }
         // The whole 8x9 area below the black wall is Black territory.
-        let summary = score(&board, &HashSet::new(), 0.0, ScoringRules::Area, (0, 0));
+        let summary = score(&board, &HashSet::new(), 0.0, RuleSet::Chinese, (0, 0));
         assert_eq!(summary.black_stones, 9);
         assert_eq!(summary.black_territory, 72);
         assert_eq!(summary.black_points, 81.0);
@@ -665,7 +893,7 @@ mod tests {
             &board,
             &HashSet::new(),
             6.5,
-            ScoringRules::Territory,
+            RuleSet::JapaneseKorean,
             (2, 0),
         );
         assert_eq!(summary.black_territory, 72);
@@ -676,16 +904,110 @@ mod tests {
     #[test]
     fn draw_detection_uses_komi() {
         let board = Board::new(9);
-        let summary = score(&board, &HashSet::new(), 0.0, ScoringRules::Area, (0, 0));
+        let summary = score(&board, &HashSet::new(), 0.0, RuleSet::Chinese, (0, 0));
         assert_eq!(summary.result(), "Draw");
     }
 
     #[test]
-    fn rules_strings_map_to_scoring_systems() {
-        assert_eq!(ScoringRules::from_ogs("chinese"), ScoringRules::Area);
-        assert_eq!(ScoringRules::from_ogs("aga"), ScoringRules::Area);
-        assert_eq!(ScoringRules::from_ogs("japanese"), ScoringRules::Territory);
-        assert_eq!(ScoringRules::from_ogs("Korean"), ScoringRules::Territory);
+    fn rules_strings_map_to_scoring_methods() {
+        assert_eq!(RuleSet::from_name("chinese").scoring_method(), ScoringMethod::Area);
+        assert_eq!(RuleSet::from_name("aga").scoring_method(), ScoringMethod::Area);
+        assert_eq!(RuleSet::from_name("japanese").scoring_method(), ScoringMethod::Territory);
+        assert_eq!(RuleSet::from_name("Korean").scoring_method(), ScoringMethod::Territory);
+        assert_eq!(RuleSet::from_name("ancient").scoring_method(), ScoringMethod::Area);
+    }
+
+    /// A finished 9×9 game: Black owns columns A–D, White owns F–J, and the
+    /// E column is a wall of alternating dame with one empty dame at E5.
+    ///
+    /// Black: wall on D (9 stones) → 27 points of territory on A–C.
+    /// White: wall on F (9 stones) → 27 points of territory on G–J... minus
+    /// one: J1 holds a captured-then-dead Black stone inside White's area.
+    fn finished_position() -> (Board, HashSet<(u8, u16)>) {
+        let mut board = Board::new(9);
+        for row in 1..=9 {
+            board.place(3, row, Color::Black);
+            board.place(5, row, Color::White);
+        }
+        // E column: everything but E5 filled, alternating colours.
+        for row in 1..=9 {
+            if row == 5 {
+                continue;
+            }
+            let color = if row < 5 { Color::Black } else { Color::White };
+            board.place(4, row, color);
+        }
+        // A dead Black stone inside White's area.
+        board.place(8, 1, Color::Black);
+        let dead = [(8u8, 1u16)].into_iter().collect();
+        (board, dead)
+    }
+
+    #[test]
+    fn chinese_counting_shares_unfilled_dame() {
+        let (board, dead) = finished_position();
+        let summary = score(&board, &dead, 7.5, RuleSet::Chinese, (0, 0));
+        // Black: 9 + 4 stones, 27 territory; White: 9 + 4 stones, 27 territory
+        // incl. the dead-stone point. E5 is shared.
+        assert_eq!(summary.black_stones, 13);
+        assert_eq!(summary.white_stones, 13);
+        assert_eq!(summary.black_territory, 27);
+        assert_eq!(summary.white_territory, 27);
+        assert_eq!(summary.dame, 1);
+        assert_eq!(summary.black_points, 40.5);
+        assert_eq!(summary.white_points, 48.0);
+        assert_eq!(summary.result(), "W+7.5");
+        // Every point is accounted for exactly once (komi aside).
+        assert_eq!(summary.black_points + summary.white_points - 7.5, 81.0);
+    }
+
+    #[test]
+    fn japanese_counting_uses_prisoners_and_ignores_dame() {
+        let (board, dead) = finished_position();
+        let summary = score(&board, &dead, 6.5, RuleSet::JapaneseKorean, (3, 2));
+        // Black: 27 territory + 3 captures. White: 27 territory + 2 captures +
+        // the dead stone as a prisoner.
+        assert_eq!(summary.black_points, 30.0);
+        assert_eq!(summary.white_points, 27.0 + 3.0 + 6.5);
+        assert_eq!(summary.result(), "W+6.5");
+    }
+
+    #[test]
+    fn ancient_counting_charges_each_living_group() {
+        let (board, dead) = finished_position();
+        let summary = score(&board, &dead, 0.0, RuleSet::AncientChinese, (0, 0));
+        assert_eq!((summary.black_groups, summary.white_groups), (1, 1));
+        assert_eq!(summary.black_points, 40.5 - 2.0);
+        assert_eq!(summary.white_points, 40.5 - 2.0);
+
+        // Two Black strings that only meet through shared territory are one group.
+        let mut shared = Board::new(9);
+        for row in 1..=9 {
+            if row != 5 {
+                shared.place(3, row, Color::Black);
+            }
+        }
+        assert_eq!(living_group_counts(&shared, &HashSet::new()), (1, 0));
+
+        // Columns B and H are separate Black groups; White's D and F walls
+        // share the E-column territory, so White is one group.
+        let mut two = Board::new(9);
+        for row in 1..=9 {
+            two.place(1, row, Color::Black);
+            two.place(3, row, Color::White);
+            two.place(5, row, Color::White);
+            two.place(7, row, Color::Black);
+        }
+        assert_eq!(living_group_counts(&two, &HashSet::new()), (2, 1));
+        let summary = score(&two, &HashSet::new(), 0.0, RuleSet::AncientChinese, (0, 0));
+        // Black: 18 stones + A, J (18) + half of C, G dame (9) − 2×2.
+        // White: 18 stones + E (9) + half the dame (9) − 2×1.
+        assert_eq!(summary.black_points, 45.0 - 4.0);
+        assert_eq!(summary.white_points, 36.0 - 2.0);
+        // Chinese counting of the same board has no tax.
+        let chinese = score(&two, &HashSet::new(), 0.0, RuleSet::Chinese, (0, 0));
+        assert_eq!(chinese.black_points, 45.0);
+        assert_eq!(chinese.white_points, 36.0);
     }
 
     #[test]
@@ -707,6 +1029,19 @@ mod tests {
     fn connected_group_for_empty_points_is_empty() {
         let board = Board::new(9);
         assert!(connected_stone_group(&board, (4, 4)).is_empty());
+    }
+
+    #[test]
+    #[ignore = "timing probe: cargo test --release -- --ignored counting_speed"]
+    fn counting_speed_probe() {
+        for size in [9u8, 13, 19] {
+            let mut board = Board::new(size);
+            board.place(3, 4, Color::Black);
+            board.place(size - 4, u16::from(size) - 3, Color::White);
+            let start = std::time::Instant::now();
+            let _ = auto_detect_dead(&board, DEFAULT_PLAYOUTS);
+            eprintln!("{size}x{size}: {:?}", start.elapsed());
+        }
     }
 
     #[test]

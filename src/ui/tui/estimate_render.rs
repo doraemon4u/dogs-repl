@@ -16,10 +16,8 @@ pub fn render_text(game: &GameView) -> String {
         out.push('\n');
         out.push_str(&format!("{summary}"));
         out.push_str(&format!(
-            "\nB territory {} · W territory {} · dame {} · dead B/W {}/{}",
-            summary.black_territory,
-            summary.white_territory,
-            summary.dame,
+            "\n{} · dead B/W {}/{}",
+            summary.breakdown(),
             summary.dead_black,
             summary.dead_white
         ));

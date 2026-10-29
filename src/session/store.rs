@@ -15,8 +15,9 @@ use crate::engine::clock::{Clock, TimeControl};
 use crate::engine::coord::Coord;
 use crate::engine::estimate::{
     auto_detect_dead, connected_stone_group, estimate_with_dead, score, PointEstimate,
-    ScoreSummary, ScoringRules, DEFAULT_PLAYOUTS,
+    ScoreSummary, DEFAULT_PLAYOUTS,
 };
+use crate::engine::rules::RuleSet;
 use crate::engine::game::Game;
 use crate::engine::sgf::{SgfGame, SgfMove};
 use serde_json::Value;
@@ -107,7 +108,7 @@ pub fn game_channel(game_id: u64) -> String {
 }
 
 /// Maps a user-facing short channel name (e.g. `"en"`, `"zh"`, `"#ja"`) to OGS's
-/// real Socket.IO wire room ID (e.g. `"global-english"`, `"global-zh-hans"`, `"global-japanese"`),
+/// real wire room ID (e.g. `"global-english"`, `"global-zh-hans"`, `"global-japanese"`),
 /// matching `online-go/online-go.com` `src/lib/chat_manager.ts`.
 pub fn to_ogs_wire_channel(channel: &str) -> String {
     let raw = channel.trim().trim_start_matches('#');
@@ -327,6 +328,8 @@ pub struct GameView {
     pub view_move: Option<u16>,
     /// Cached snapshot at `view_move` when reviewing an earlier move.
     pub review_game: Option<Game>,
+    /// A 摆谱 board played and counted on this machine only (never sent to OGS).
+    pub local: bool,
 }
 
 impl GameView {
@@ -353,7 +356,38 @@ impl GameView {
             scoring_last_message: None,
             view_move: None,
             review_game: None,
+            local: false,
         }
+    }
+
+    /// A fresh local game (摆谱) under `rules`, with that rule set's komi.
+    pub fn local(id: u64, size: u8, rules: RuleSet) -> Self {
+        let mut view = Self::empty(id, size);
+        view.komi = rules.default_komi();
+        view.rules = rules.id().to_string();
+        view.game = Game::with_rules(size, rules);
+        view.local = true;
+        view
+    }
+
+    /// Undoes the last move of a local game. Returns the removed move.
+    pub fn undo_local(&mut self) -> Option<crate::engine::game::PlayedMove> {
+        if let Some(cursor) = self.view_move {
+            let _ = self.game.truncate_to(cursor);
+            self.view_move = None;
+            self.review_game = None;
+        }
+        let removed = self.game.undo()?;
+        self.clock.set_active(Some(self.game.to_play()));
+        if self.estimate_active {
+            self.exit_estimate();
+        }
+        Some(removed)
+    }
+
+    /// The rule set this game is played and counted under.
+    pub fn rule_set(&self) -> RuleSet {
+        self.game.rule_set()
     }
 
     pub fn board(&self) -> &Board {
@@ -490,7 +524,7 @@ impl GameView {
             self.board(),
             &self.estimate_dead,
             self.komi,
-            ScoringRules::from_ogs(&self.rules),
+            self.rule_set(),
             captures,
         );
         self.estimate_summary = Some(summary.clone());
@@ -499,6 +533,13 @@ impl GameView {
 
     /// Runs Monte-Carlo automatic dead-stone detection on the currently displayed board,
     /// enters estimate mode, and recomputes the local score summary.
+    /// Enters estimate mode with dead stones found off the store lock.
+    pub fn apply_auto_dead(&mut self, dead: HashSet<Point>) -> ScoreSummary {
+        self.estimate_active = true;
+        self.estimate_dead = dead;
+        self.recompute_estimate()
+    }
+
     pub fn auto_estimate(&mut self) -> ScoreSummary {
         self.estimate_active = true;
         self.estimate_dead = auto_detect_dead(self.board(), DEFAULT_PLAYOUTS);
@@ -570,8 +611,12 @@ impl GameView {
             Some(self.white.clone()),
         );
         sgf.board_size = self.size;
-        sgf.rules = Some(self.rules.clone());
-        sgf.game_name = Some(format!("OGS Game #{}", self.id));
+        sgf.rules = Some(self.rule_set().sgf_name().to_string());
+        sgf.game_name = Some(if self.local {
+            format!("摆谱 {}x{}", self.size, self.size)
+        } else {
+            format!("OGS Game #{}", self.id)
+        });
         sgf.result = self.result.clone();
         sgf.set_time_control(self.clock.control());
         sgf.moves = self
@@ -592,14 +637,14 @@ impl GameView {
 
     /// Builds a [`GameView`] from a parsed [`SgfGame`].
     pub fn from_sgf_game(id: u64, sgf: &SgfGame) -> Result<Self, String> {
-        let game = sgf.replay_game().map_err(|e| e.to_string())?;
+        let mut game = sgf.replay_game().map_err(|e| e.to_string())?;
+        let rules = sgf.rules.as_deref().map(RuleSet::from_name).unwrap_or_default();
+        game.set_rule_set(rules);
         let size = game.size();
         let mut view = Self::empty(id, size);
         view.size = size;
         view.komi = sgf.komi;
-        if let Some(rules) = &sgf.rules {
-            view.rules = rules.to_ascii_lowercase();
-        }
+        view.rules = rules.id().to_string();
         if let Some(black) = &sgf.player_black {
             view.black = black.clone();
         }
@@ -620,6 +665,7 @@ impl GameView {
         view.clock = Clock::new(sgf.time_control(), active);
         view.game = game;
         view.connected = false;
+        view.local = true;
         Ok(view)
     }
 
@@ -634,15 +680,35 @@ impl GameView {
         } else {
             format!("move {}", self.game.move_number())
         };
+        let phase = if self.local {
+            if self.game.is_finished() {
+                "摆谱 · counting".to_string()
+            } else {
+                format!("摆谱 · {:?} to play", self.game.to_play())
+            }
+        } else {
+            self.phase.label().to_string()
+        };
         format!(
-            "{} vs {} · {}x{} · {} · {}",
+            "{} vs {} · {}x{} · {} · {} · {}",
             self.black,
             self.white,
             self.size,
             self.size,
+            self.rule_set().id(),
             move_part,
-            self.phase.label()
+            phase
         )
+    }
+}
+
+/// Formats an OGS numeric ranking (30 = 1d) as `5k` / `3d`.
+fn rank_label(ranking: f64) -> String {
+    let rank = ranking.floor() as i64;
+    if rank >= 30 {
+        format!("{}d", rank - 29)
+    } else {
+        format!("{}k", 30 - rank)
     }
 }
 
@@ -673,7 +739,20 @@ pub struct Store {
     pub log_seq: u64,
     pub chat_seq: u64,
     pub world_channel: String,
+    /// Bots currently online, from the socket's `active-bots` push.
+    pub online_bots: Vec<BotInfo>,
 }
+
+/// An OGS bot account that is online right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotInfo {
+    pub id: i64,
+    pub username: String,
+    pub ranking: Option<String>,
+}
+
+/// Local (摆谱) game ids start here so they can never collide with OGS ids.
+pub const LOCAL_GAME_ID_BASE: u64 = 1 << 40;
 
 impl Default for Store {
     fn default() -> Self {
@@ -686,16 +765,13 @@ impl Store {
         let world_channel = world_channel.into();
         let mut channels = BTreeMap::new();
         channels.insert(world_channel.clone(), ChannelState::default());
-        let mut games = BTreeMap::new();
-        let default_view = GameView::empty(42, 9);
-        games.insert(42, default_view);
         Self {
             connection: ConnectionState::Offline,
             connection_message: None,
             username: None,
             user_id: None,
-            games,
-            active_game: Some(42),
+            games: BTreeMap::new(),
+            active_game: None,
             chat_scope: ChatScope::World {
                 channel: world_channel.clone(),
             },
@@ -712,7 +788,43 @@ impl Store {
             log_seq: 0,
             chat_seq: 0,
             world_channel,
+            online_bots: Vec::new(),
         }
+    }
+
+    /// The next unused local game id.
+    pub fn next_local_game_id(&self) -> u64 {
+        self.games
+            .range(LOCAL_GAME_ID_BASE..)
+            .next_back()
+            .map_or(LOCAL_GAME_ID_BASE, |(id, _)| id + 1)
+    }
+
+    /// Replaces the online bot list from an `active-bots` payload.
+    ///
+    /// OGS sends either an object keyed by player id or an array of players.
+    pub fn apply_active_bots(&mut self, value: &Value) {
+        let entries: Vec<&Value> = match value {
+            Value::Object(map) => map.values().collect(),
+            Value::Array(list) => list.iter().collect(),
+            _ => Vec::new(),
+        };
+        let mut bots: Vec<BotInfo> = entries
+            .into_iter()
+            .filter_map(|bot| {
+                let id = bot.get("id").and_then(Value::as_i64)?;
+                let username = bot.get("username").and_then(Value::as_str)?.to_string();
+                let ranking = bot.get("ranking").and_then(|rank| match rank {
+                    Value::Number(n) => n.as_f64().map(rank_label),
+                    Value::String(text) => Some(text.clone()),
+                    _ => None,
+                });
+                Some(BotInfo { id, username, ranking })
+            })
+            .collect();
+        bots.sort_by_key(|bot| bot.username.to_ascii_lowercase());
+        bots.dedup_by_key(|bot| bot.id);
+        self.online_bots = bots;
     }
 
     /// Appends a log line and returns its sequence number.
@@ -1697,15 +1809,16 @@ pub fn game_view_from_json(value: &Value, user_id: Option<i64>) -> Option<GameVi
     let starts_with_white = handicap > 0
         || initial.iter().any(|(color, _)| *color == Color::Black);
     let moves = parse_gamedata_moves(value, size, starts_with_white);
-    let game = Game::from_setup_and_moves(size, &initial, &moves)
-        .unwrap_or_else(|_| Game::new(size));
-
-    let komi = value.get("komi").and_then(Value::as_f64).unwrap_or(6.5);
     let rules = value
         .get("rules")
         .and_then(Value::as_str)
         .unwrap_or("chinese")
         .to_string();
+    let rule_set = RuleSet::from_name(&rules);
+    let game = Game::from_setup_and_moves_with_rules(size, rule_set, &initial, &moves)
+        .unwrap_or_else(|_| Game::with_rules(size, rule_set));
+
+    let komi = value.get("komi").and_then(Value::as_f64).unwrap_or(6.5);
     let phase = GamePhase::from_ogs(
         value
             .get("phase")
@@ -1777,6 +1890,7 @@ pub fn game_view_from_json(value: &Value, user_id: Option<i64>) -> Option<GameVi
         scoring_last_message: None,
         view_move: None,
         review_game: None,
+        local: false,
     };
     if let Some(removed) = value
         .get("removed_stones")

@@ -30,7 +30,9 @@ impl Scene {
         match self {
             Scene::Lobby => (72, 20),
             Scene::Game { board_size } => {
-                let width = board_pane_width(board_size) + SIDE_PANEL_MIN_WIDTH;
+                // The board gets exactly half the width, so both halves must
+                // fit: the smallest board pane and the side column.
+                let width = board_pane_width(board_size).max(SIDE_PANEL_MIN_WIDTH) * 2;
                 let height = (board_pane_height(board_size) + INPUT_ROWS).max(22);
                 (width, height)
             }
@@ -92,6 +94,10 @@ pub fn too_small(area: Rect, scene: Scene) -> Option<(u16, u16)> {
 }
 
 /// Splits the game screen into header, board, moves, chat, status, and input.
+///
+/// The board pane is always exactly half the window's width (the left
+/// half, rounded down for odd widths) and the full height between the header
+/// and the status line. The board itself is drawn as large as fits inside it.
 pub fn split_game(area: Rect, _board_size: u8) -> GameLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
@@ -106,12 +112,10 @@ pub fn split_game(area: Rect, _board_size: u8) -> GameLayout {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(bottom);
+    let board_width = area.width / 2;
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Ratio(2, 3),
-            Constraint::Ratio(1, 3),
-        ])
+        .constraints([Constraint::Length(board_width), Constraint::Min(0)])
         .split(main);
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -200,10 +204,11 @@ mod tests {
     }
 
     #[test]
-    fn game_layout_fits_and_uses_a_fixed_board() {
+    fn game_layout_fits_and_sizes_the_board_per_size() {
         let area = Rect::new(0, 0, 120, 40);
         let layout = split_game(area, 19);
-        assert_eq!(layout.board.width, 80);
+        assert_eq!(layout.board.width, 60, "board pane is half the window");
+        assert!(area.width - layout.board.width >= SIDE_PANEL_MIN_WIDTH);
         assert_eq!(layout.board.x, 0);
         assert_eq!(layout.status.height, 1);
         assert_eq!(layout.input.height, 1);
@@ -232,10 +237,30 @@ mod tests {
     }
 
     #[test]
+    fn the_board_pane_is_always_half_the_window() {
+        for size in [9u8, 13, 19] {
+            let (min_w, min_h) = Scene::Game { board_size: size }.min_size();
+            for &(w, h) in &[(min_w, min_h), (100u16, 30u16), (141, 45), (200, 60)] {
+                let w = w.max(min_w);
+                let h = h.max(min_h);
+                let area = Rect::new(0, 0, w, h);
+                let layout = split_game(area, size);
+                assert_eq!(layout.board.width, w / 2, "{size}x{size} in {w}x{h}");
+                assert_eq!(layout.moves.x, w / 2, "side column starts at the middle");
+                assert_eq!(layout.moves.width, w - w / 2);
+                assert_eq!(layout.board.height, h - 1 - INPUT_ROWS);
+                // At the minimum size the side column is still usable.
+                assert!(layout.moves.width >= SIDE_PANEL_MIN_WIDTH);
+            }
+        }
+    }
+
+    #[test]
     fn lobby_layout_has_one_outer_panel() {
         let area = Rect::new(0, 0, 100, 30);
         let layout = split_lobby(area);
-        assert_eq!(layout.panel, Rect::new(0, 0, 100, 28));
+        // Row 0 is the header bar; the panel fills the rest above the bottom bars.
+        assert_eq!(layout.panel, Rect::new(0, 1, 100, 27));
         assert_eq!(layout.status.y, 28);
         assert_eq!(layout.input.y, 29);
         assert!(layout.games.width > 0);

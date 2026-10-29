@@ -6,6 +6,7 @@
 //! the estimate mode reuses the same parser.
 
 use crate::engine::coord::{parse_coord, Coord};
+use crate::engine::rules::{RuleSet, SUPPORTED_SIZES};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum UserCommand {
@@ -27,10 +28,13 @@ pub enum UserCommand {
     ChallengeDecline(i64),
     OpenGame(u64),
     CloseGame,
-    BoardSize(u8),
+    /// Opens the New Game flow; any field already given skips that step.
+    NewGame(NewGameSpec),
     LoadSgf(u64),
     LoadSgfFile(String),
     SaveSgfFile(String),
+    /// `sgf load` / `sgf save` without a path: ask for one.
+    PromptSgfPath(SgfAction),
     Step(StepCommand),
     Coordinate(Coord),
     Pass,
@@ -55,6 +59,93 @@ pub enum UserCommand {
     Focus(String),
     Unknown(String),
     Invalid(String),
+}
+
+/// What a New Game is played against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMode {
+    /// A challenge to an OGS bot account.
+    VsAi,
+    /// 摆谱: both colors on this machine, with counting.
+    Local,
+}
+
+impl GameMode {
+    pub const ALL: [GameMode; 2] = [Self::VsAi, Self::Local];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::VsAi => "人机对弈 vs AI (OGS bot)",
+            Self::Local => "摆谱 local play + counting",
+        }
+    }
+
+    /// Rule sets this mode can be played under. OGS has no ancient rules.
+    pub fn rule_sets(self) -> &'static [RuleSet] {
+        match self {
+            Self::VsAi => &[RuleSet::Chinese, RuleSet::JapaneseKorean],
+            Self::Local => &RuleSet::ALL,
+        }
+    }
+}
+
+/// Choices made so far in the New Game flow.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NewGameSpec {
+    pub size: Option<u8>,
+    pub mode: Option<GameMode>,
+    pub rules: Option<RuleSet>,
+    /// Bot username for [`GameMode::VsAi`].
+    pub bot: Option<String>,
+}
+
+impl NewGameSpec {
+    /// True when every step needed to start the game has an answer.
+    pub fn is_complete(&self) -> bool {
+        match self.mode {
+            Some(GameMode::Local) => self.size.is_some() && self.rules.is_some(),
+            Some(GameMode::VsAi) => {
+                self.size.is_some() && self.rules.is_some() && self.bot.is_some()
+            }
+            None => false,
+        }
+    }
+}
+
+/// Which SGF operation is waiting for a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SgfAction {
+    Load,
+    Save,
+}
+
+impl SgfAction {
+    pub const fn prompt(self) -> &'static str {
+        match self {
+            Self::Load => "SGF file to import",
+            Self::Save => "save SGF to",
+        }
+    }
+
+    /// Turns a typed path into the matching command (`None` for a blank line).
+    pub fn with_path(self, path: &str) -> Option<UserCommand> {
+        let path = expand_home(path.trim());
+        if path.is_empty() {
+            return None;
+        }
+        Some(match self {
+            Self::Load => UserCommand::LoadSgfFile(path),
+            Self::Save => UserCommand::SaveSgfFile(path),
+        })
+    }
+}
+
+/// Expands a leading `~/` so typed paths behave like they do in a shell.
+pub fn expand_home(path: &str) -> String {
+    match (path.strip_prefix("~/"), std::env::var("HOME")) {
+        (Some(rest), Ok(home)) => format!("{home}/{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -251,10 +342,10 @@ pub fn parse(input: &str) -> UserCommand {
             Some("ko") | Some("eye") | None => UserCommand::PresetKo,
             Some(other) => UserCommand::Invalid(format!("unknown preset '{other}' (available: ko)")),
         },
-        "size" | "board" | "new" => match parts.get(1).and_then(|raw| raw.parse::<u8>().ok()) {
-            Some(size) if [9, 13, 19].contains(&size) => UserCommand::BoardSize(size),
-            _ => UserCommand::Invalid("usage: size <9|13|19> (supported board sizes: 9, 13, 19)".into()),
-        },
+        "new" | "newgame" | "新对局" => parse_new_game(&parts[1..]),
+        "size" | "board" => UserCommand::Invalid(
+            "board size is chosen when starting a game: use `new` (e.g. `new 19 local chinese`)".into(),
+        ),
         "estimate" | "est" => match parts.get(1).map(|value| value.to_ascii_lowercase()) {
             None => UserCommand::Estimate(EstimateCommand::Enter),
             Some(action) => match action.as_str() {
@@ -313,24 +404,18 @@ fn parse_sgf(input: &str, parts: &[&str]) -> UserCommand {
         "load" | "open" | "import" => {
             let path = rest_after(input, parts[0])
                 .and_then(|rest| rest_after(rest, parts[1]))
-                .map(str::trim)
                 .unwrap_or_default();
-            if path.is_empty() {
-                UserCommand::Invalid("usage: sgf load <path>".into())
-            } else {
-                UserCommand::LoadSgfFile(path.to_string())
-            }
+            SgfAction::Load
+                .with_path(path)
+                .unwrap_or(UserCommand::PromptSgfPath(SgfAction::Load))
         }
         "save" | "export" | "write" => {
             let path = rest_after(input, parts[0])
                 .and_then(|rest| rest_after(rest, parts[1]))
-                .map(str::trim)
                 .unwrap_or_default();
-            if path.is_empty() {
-                UserCommand::Invalid("usage: sgf save <path>".into())
-            } else {
-                UserCommand::SaveSgfFile(path.to_string())
-            }
+            SgfAction::Save
+                .with_path(path)
+                .unwrap_or(UserCommand::PromptSgfPath(SgfAction::Save))
         }
         _ => {
             if let Some(id) = parse_id(Some(first)).filter(|&id| id > 0) {
@@ -345,6 +430,46 @@ fn parse_sgf(input: &str, parts: &[&str]) -> UserCommand {
             }
         }
     }
+}
+
+/// `new [9|13|19] [ai|local] [chinese|japanese|ancient] [bot]`, in any order.
+fn parse_new_game(args: &[&str]) -> UserCommand {
+    let mut spec = NewGameSpec::default();
+    for arg in args {
+        let lower = arg.to_ascii_lowercase();
+        if let Ok(size) = lower.trim_end_matches("x9").trim_end_matches("x13").trim_end_matches("x19").parse::<u8>() {
+            if !SUPPORTED_SIZES.contains(&size) {
+                return UserCommand::Invalid(format!(
+                    "unsupported board size {size}: choose 9, 13 or 19"
+                ));
+            }
+            spec.size = Some(size);
+            continue;
+        }
+        match lower.as_str() {
+            "ai" | "bot" | "vs-ai" | "人机" => spec.mode = Some(GameMode::VsAi),
+            "local" | "self" | "摆谱" | "baipu" => spec.mode = Some(GameMode::Local),
+            "chinese" | "cn" | "中国" | "japanese" | "jp" | "korean" | "kr" | "日韩"
+            | "ancient" | "古法" => spec.rules = Some(RuleSet::from_name(&lower)),
+            _ if spec.mode == Some(GameMode::VsAi) && spec.bot.is_none() => {
+                spec.bot = Some((*arg).to_string());
+            }
+            other => {
+                return UserCommand::Invalid(format!(
+                    "unknown `new` option '{other}' (usage: new [9|13|19] [ai|local] [chinese|japanese|ancient] [bot])"
+                ))
+            }
+        }
+    }
+    if let (Some(mode), Some(rules)) = (spec.mode, spec.rules) {
+        if !mode.rule_sets().contains(&rules) {
+            return UserCommand::Invalid(format!(
+                "{} is only available for 摆谱 (OGS has no such rule set)",
+                rules.label()
+            ));
+        }
+    }
+    UserCommand::NewGame(spec)
 }
 
 fn parse_step(parts: &[&str]) -> UserCommand {
@@ -651,7 +776,9 @@ pub fn help_text() -> &'static str {
     "OGS commands
   login <user> [password] | logout | connect | refresh | whoami
   lobby | games | challenges | player <name|id> | notifications
-  game <id> | close | size <9|13|19> | sgf <id> | sgf load <path> | sgf save <path>
+  new [9|13|19] [ai|local] [chinese|japanese|ancient] [bot]   (F1: New Game)
+      local = 摆谱: both colors here, two passes then counting; `undo` takes back
+  game <id> | close | sgf <id> | sgf load [path] | sgf save [path]
   step [prev|next|first|last|<move>] | prev [n] | next [n] | first | last | goto <move>
   [a10] | play D4 | pass | resign | undo [request|accept|decline] [move]
   chat <text> | channels [channel] | join <channel> | part <channel> | world <channel>
@@ -677,6 +804,47 @@ pub fn prompt(game_id: Option<u64>, estimate: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_new_game_forms() {
+        assert_eq!(parse("new"), UserCommand::NewGame(NewGameSpec::default()));
+        assert_eq!(
+            parse("new 19 local japanese"),
+            UserCommand::NewGame(NewGameSpec {
+                size: Some(19),
+                mode: Some(GameMode::Local),
+                rules: Some(RuleSet::JapaneseKorean),
+                bot: None,
+            })
+        );
+        assert_eq!(
+            parse("newgame ai 9 chinese Kata-Bot"),
+            UserCommand::NewGame(NewGameSpec {
+                size: Some(9),
+                mode: Some(GameMode::VsAi),
+                rules: Some(RuleSet::Chinese),
+                bot: Some("Kata-Bot".into()),
+            })
+        );
+        assert!(matches!(parse("new 10"), UserCommand::Invalid(_)));
+        assert!(matches!(parse("new ai ancient"), UserCommand::Invalid(_)));
+        let local_ancient = parse("new 13x13 摆谱 古法");
+        let UserCommand::NewGame(spec) = local_ancient else { panic!("{local_ancient:?}") };
+        assert!(spec.is_complete());
+        assert_eq!(spec.rules, Some(RuleSet::AncientChinese));
+    }
+
+    #[test]
+    fn sgf_without_a_path_asks_for_one() {
+        assert_eq!(parse("sgf load"), UserCommand::PromptSgfPath(SgfAction::Load));
+        assert_eq!(parse("sgf save  "), UserCommand::PromptSgfPath(SgfAction::Save));
+        assert_eq!(parse("sgf save /tmp/a b.sgf"), UserCommand::SaveSgfFile("/tmp/a b.sgf".into()));
+        assert_eq!(SgfAction::Load.with_path("   "), None);
+        assert_eq!(
+            SgfAction::Load.with_path(" x.sgf "),
+            Some(UserCommand::LoadSgfFile("x.sgf".into()))
+        );
+    }
 
     #[test]
     fn parses_basic_commands() {
@@ -869,7 +1037,7 @@ mod tests {
             panic!("unexpected: {command:?}");
         };
         assert_eq!(spec.opponent, "kata");
-        assert_eq!(spec.board_size, 19);
+        assert_eq!(spec.board_size, 9);
         assert_eq!(spec.rules, "chinese");
         assert!(spec.ranked);
         assert_eq!(
@@ -933,10 +1101,8 @@ mod tests {
         assert_eq!(parse("channel ko"), UserCommand::Join("ko".into()));
         assert_eq!(parse("part zh"), UserCommand::Part("zh".into()));
         assert_eq!(parse("world ja"), UserCommand::World("ja".into()));
-        assert_eq!(parse("size 9"), UserCommand::BoardSize(9));
-        assert_eq!(parse("board 13"), UserCommand::BoardSize(13));
-        assert_eq!(parse("new 19"), UserCommand::BoardSize(19));
-        assert!(matches!(parse("size 10"), UserCommand::Invalid(_)));
+        assert!(matches!(parse("size 9"), UserCommand::Invalid(text) if text.contains("new")));
+        assert!(matches!(parse("board 13"), UserCommand::Invalid(_)));
         assert_eq!(parse("score"), UserCommand::Score(ScoreCommand::Show));
         assert_eq!(
             parse("score accept"),

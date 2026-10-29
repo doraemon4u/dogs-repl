@@ -7,7 +7,7 @@
 
 use super::board::{Board, Color};
 use super::coord::Coord;
-use super::rules::{self, MoveError};
+use super::rules::{self, MoveError, RuleSet};
 use std::collections::HashSet;
 
 /// One move in the game history.
@@ -35,11 +35,17 @@ pub struct Game {
     history: Vec<PlayedMove>,
     setup: Vec<(Color, Coord)>,
     prior_positions: HashSet<Vec<Option<Color>>>,
+    rules: RuleSet,
 }
 
 impl Game {
-    /// Creates an empty game with Black to play.
+    /// Creates an empty game with Black to play under Chinese rules.
     pub fn new(size: u8) -> Self {
+        Self::with_rules(size, RuleSet::default())
+    }
+
+    /// Creates an empty game with Black to play under `rules`.
+    pub fn with_rules(size: u8, rules: RuleSet) -> Self {
         let board = Board::new(size);
         let mut prior_positions = HashSet::new();
         prior_positions.insert(board.grid_signature().to_vec());
@@ -54,6 +60,37 @@ impl Game {
             history: Vec::new(),
             setup: Vec::new(),
             prior_positions,
+            rules,
+        }
+    }
+
+    /// The rule set placement and counting follow.
+    pub const fn rule_set(&self) -> RuleSet {
+        self.rules
+    }
+
+    /// Changes the rule set. Only meaningful before or between moves; the
+    /// position history is kept so a switch to Chinese still sees it.
+    pub fn set_rule_set(&mut self, rules: RuleSet) {
+        self.rules = rules;
+    }
+
+    /// Checks `color` at `coord` against the active rule set.
+    fn check(&self, color: Color, coord: Coord) -> Result<usize, MoveError> {
+        if !coord.is_on_board(self.size()) {
+            return Err(MoveError::OffBoard);
+        }
+        if self.rules.positional_superko() {
+            rules::validate_move_with_superko(
+                self.board(),
+                coord.col,
+                coord.row,
+                color,
+                self.ko_point,
+                &self.prior_positions,
+            )
+        } else {
+            rules::validate_move(self.board(), coord.col, coord.row, color, self.ko_point)
         }
     }
 
@@ -119,7 +156,22 @@ impl Game {
         if self.board.get(coord.col, coord.row).is_some() {
             return Err(MoveError::Occupied);
         }
-        self.board.place(coord.col, coord.row, color);
+        // Setup stones are placed without captures, so a stone that would
+        // leave any adjacent group (its own or the opponent's) with no
+        // liberties describes a position that cannot exist on a Go board.
+        let mut next = self.board.clone();
+        next.place(coord.col, coord.row, color);
+        let mut touched = vec![(coord.col, coord.row)];
+        touched.extend(next.neighbors(coord.col, coord.row));
+        for (col, row) in touched {
+            if next.get(col, row).is_some() {
+                let group = rules::collect_group(&next, col, row);
+                if rules::count_liberties(&next, &group) == 0 {
+                    return Err(MoveError::Suicide);
+                }
+            }
+        }
+        self.board = next;
         self.setup.push((color, coord));
         if self.history.is_empty() {
             self.prior_positions.clear();
@@ -144,40 +196,12 @@ impl Game {
 
     /// Validates whether `coord` is legal for `self.to_play()` without mutating the game.
     pub fn validate(&self, coord: Coord) -> Result<usize, MoveError> {
-        if !coord.is_on_board(self.size()) {
-            return Err(MoveError::OffBoard);
-        }
-        rules::validate_move_with_superko(
-            self.board(),
-            coord.col,
-            coord.row,
-            self.to_play,
-            self.ko_point,
-            &self.prior_positions,
-        )
+        self.check(self.to_play, coord)
     }
 
     /// Plays a move for `to_play`.
     pub fn play(&mut self, coord: Coord) -> Result<&PlayedMove, MoveError> {
-        if !coord.is_on_board(self.size()) {
-            return Err(MoveError::OffBoard);
-        }
-        let color = self.to_play;
-        rules::validate_move_with_superko(
-            self.board(),
-            coord.col,
-            coord.row,
-            color,
-            self.ko_point,
-            &self.prior_positions,
-        )?;
-        let captured = rules::execute_move(&mut self.board, coord.col, coord.row, color);
-        self.record_captures(color, &captured);
-        self.ko_point = detect_ko(&self.board, coord.col, coord.row, &captured);
-        self.prior_positions
-            .insert(self.board.grid_signature().to_vec());
-        self.push_move(color, Some(coord), captured);
-        Ok(self.history.last().expect("move was just pushed"))
+        self.play_colored(self.to_play, coord)
     }
 
     /// Plays a move for a specific color, used when replaying SGF or server
@@ -187,17 +211,7 @@ impl Game {
         color: Color,
         coord: Coord,
     ) -> Result<&PlayedMove, MoveError> {
-        if !coord.is_on_board(self.size()) {
-            return Err(MoveError::OffBoard);
-        }
-        rules::validate_move_with_superko(
-            self.board(),
-            coord.col,
-            coord.row,
-            color,
-            self.ko_point,
-            &self.prior_positions,
-        )?;
+        self.check(color, coord)?;
         let captured = rules::execute_move(&mut self.board, coord.col, coord.row, color);
         self.record_captures(color, &captured);
         self.ko_point = detect_ko(&self.board, coord.col, coord.row, &captured);
@@ -225,7 +239,7 @@ impl Game {
         let size = self.size();
         let setup = self.setup.clone();
         let initial_to_play = self.initial_to_play;
-        *self = Self::new(size);
+        *self = Self::with_rules(size, self.rules);
         self.initial_to_play = initial_to_play;
         for (color, coord) in setup {
             let _ = self.place_setup(color, coord);
@@ -262,7 +276,17 @@ impl Game {
         setup: &[(Color, Coord)],
         moves: &[(Color, Option<Coord>)],
     ) -> Result<Self, MoveError> {
-        let mut game = Self::new(size);
+        Self::from_setup_and_moves_with_rules(size, RuleSet::default(), setup, moves)
+    }
+
+    /// Replays setup stones followed by moves under `rules`.
+    pub fn from_setup_and_moves_with_rules(
+        size: u8,
+        rules: RuleSet,
+        setup: &[(Color, Coord)],
+        moves: &[(Color, Option<Coord>)],
+    ) -> Result<Self, MoveError> {
+        let mut game = Self::with_rules(size, rules);
         for (color, coord) in setup {
             game.place_setup(*color, *coord)?;
         }
@@ -296,7 +320,7 @@ impl Game {
             .collect();
         let setup = self.setup.clone();
         let initial_to_play = self.initial_to_play;
-        *self = Self::new(self.size());
+        *self = Self::with_rules(self.size(), self.rules);
         self.initial_to_play = initial_to_play;
         for (color, coord) in setup {
             self.place_setup(color, coord)?;
@@ -442,24 +466,21 @@ mod tests {
         // Build the ko shape as setup stones so the pre-set groups are not
         // captured while the position is being assembled.
         let setup = [
-            (Color::Black, c(0, 3)),
-            (Color::White, c(1, 3)),
-            (Color::Black, c(2, 3)),
-            (Color::White, c(0, 2)),
-            (Color::Black, c(1, 2)),
-            (Color::Black, c(3, 2)),
-            (Color::Black, c(4, 2)),
-            (Color::Black, c(0, 1)),
-            (Color::White, c(1, 1)),
-            (Color::Black, c(2, 1)),
+            (Color::Black, c(1, 3)),
+            (Color::Black, c(0, 2)),
+            (Color::Black, c(1, 1)),
+            (Color::White, c(2, 3)),
+            (Color::White, c(1, 2)),
+            (Color::White, c(3, 2)),
+            (Color::White, c(2, 1)),
         ];
         let mut game = Game::from_setup_and_moves(9, &setup, &[]).unwrap();
-        game.set_to_play(Color::White);
+        game.set_to_play(Color::Black);
         game.play(c(2, 2)).unwrap();
         assert_eq!(game.board().get(1, 2), None);
         assert_eq!(game.ko_point(), Some((1, 2)));
         assert_eq!(game.play(c(1, 2)), Err(MoveError::Ko));
-        // After one move elsewhere the ko is legal again.
+        // After a ko threat and answer the retake is legal again.
         game.play(c(6, 6)).unwrap();
         game.play(c(6, 7)).unwrap();
         game.play(c(1, 2)).unwrap();
@@ -571,16 +592,14 @@ mod tests {
     #[test]
     fn dead_eye_suicide_and_superko_are_rejected() {
         let setup = [
-            (Color::Black, c(0, 3)),
-            (Color::White, c(1, 3)),
-            (Color::Black, c(2, 3)),
-            (Color::White, c(0, 2)),
-            (Color::Black, c(1, 2)),
-            (Color::Black, c(3, 2)),
-            (Color::Black, c(4, 2)),
-            (Color::Black, c(0, 1)),
-            (Color::White, c(1, 1)),
-            (Color::Black, c(2, 1)),
+            // A real ko around (1,2)/(2,2); every stone starts with a liberty.
+            (Color::Black, c(1, 3)),
+            (Color::Black, c(0, 2)),
+            (Color::Black, c(1, 1)),
+            (Color::White, c(2, 3)),
+            (Color::White, c(1, 2)),
+            (Color::White, c(3, 2)),
+            (Color::White, c(2, 1)),
             // Dead eye for White at (8,1) surrounded by Black at (7,1) and (8,2)
             (Color::Black, c(7, 1)),
             (Color::Black, c(8, 2)),
@@ -590,14 +609,49 @@ mod tests {
         // White cannot play into the dead eye at (8,1)
         assert_eq!(game.play(c(8, 1)), Err(MoveError::Suicide));
 
-        // White captures at (2,2), creating ko at (1,2)
-        game.play(c(2, 2)).unwrap();
-        // Immediate recapture at (1,2) is rejected by Ko
+        game.set_to_play(Color::Black);
+        // Black takes the ko at (2,2)
+        assert_eq!(game.play(c(2, 2)).unwrap().captured, vec![c(1, 2)]);
+        // Immediate retake at (1,2) is rejected by Ko
         assert_eq!(game.play(c(1, 2)), Err(MoveError::Ko));
-        // If both players pass (clearing simple ko without changing the board),
-        // recapturing at (1,2) would recreate the initial setup board position and is rejected by Superko!
+        // After two passes the simple-ko ban is gone, but retaking would
+        // recreate the starting position: Chinese rules forbid it (superko).
         game.pass();
         game.pass();
         assert_eq!(game.play(c(1, 2)), Err(MoveError::Superko));
+
+        // Japanese/Korean rules only ban the immediate retake.
+        let mut jp = Game::from_setup_and_moves_with_rules(9, RuleSet::JapaneseKorean, &setup, &[]).unwrap();
+        jp.play(c(2, 2)).unwrap();
+        assert_eq!(jp.play(c(1, 2)), Err(MoveError::Ko));
+        jp.pass();
+        jp.pass();
+        assert!(jp.play(c(1, 2)).is_ok());
+    }
+
+    #[test]
+    fn setup_rejects_stones_without_liberties() {
+        let mut game = Game::new(9);
+        game.place_setup(Color::White, c(0, 2)).unwrap();
+        game.place_setup(Color::White, c(1, 1)).unwrap();
+        // Black (0,1) would have no liberties and nothing is captured in setup.
+        assert_eq!(game.place_setup(Color::Black, c(0, 1)), Err(MoveError::Suicide));
+        // White (5,6) would take the last liberty of Black (5,5).
+        game.place_setup(Color::Black, c(5, 5)).unwrap();
+        game.place_setup(Color::White, c(4, 5)).unwrap();
+        game.place_setup(Color::White, c(6, 5)).unwrap();
+        game.place_setup(Color::White, c(5, 4)).unwrap();
+        assert_eq!(game.place_setup(Color::White, c(5, 6)), Err(MoveError::Suicide));
+        assert_eq!(game.board().get(5, 6), None);
+    }
+
+    #[test]
+    fn rule_set_survives_undo() {
+        let mut game = Game::with_rules(13, RuleSet::AncientChinese);
+        game.play(c(3, 3)).unwrap();
+        game.play(c(9, 9)).unwrap();
+        game.undo();
+        assert_eq!(game.rule_set(), RuleSet::AncientChinese);
+        assert_eq!(game.move_number(), 1);
     }
 }

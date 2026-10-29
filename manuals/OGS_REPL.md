@@ -21,7 +21,7 @@ OGS 的客户端与服务端通信分两条通道:
 | 通道 | 用途 | 特点 |
 |---|---|---|
 | **REST API**(apiary 文档) | 低频操作:登录、创建/接受挑战、锦标赛、梯队、死活题、用户资料等 | 请求-响应模式 |
-| **Realtime API**(基于 Socket.IO) | 高频/实时操作:落子、看棋、聊天、通知推送、对局心跳保活 | 长连接,JSON 消息 |
+| **Realtime API**(纯 WebSocket,`wss://online-go.com`,JSON 数组帧) | 高频/实时操作:落子、看棋、聊天、通知推送、对局心跳保活 | 长连接,JSON 消息 |
 
 Realtime 消息格式:
 - 客户端 → 服务端:`{ command, data, id? }`,`id` 可选,若携带则服务端会回一条带相同 `id` 的响应
@@ -58,7 +58,7 @@ Realtime 消息格式:
 ├─────────────────────────────────────────┤
 │  Transport Layer                         │
 │  - RestClient(OAuth2+PKCE,低频操作)       │
-│  - RealtimeClient(socket.io,JSON 协议)    │
+│  - RealtimeClient(WebSocket,JSON 协议)    │
 └─────────────────────────────────────────┘
 ```
 
@@ -74,7 +74,7 @@ Realtime 消息格式:
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json"] }     # REST + OAuth2 PKCE
-rust_socketio = { version = "0.6", features = ["async"] } # Realtime API
+tokio-tungstenite = "=0.21.0"                             # Realtime API (plain WebSocket)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ratatui = "0.29"       # TUI 渲染
@@ -82,7 +82,7 @@ crossterm = "0.28"     # 终端后端 + resize 事件
 reedline = "0.38"       # REPL 输入行(历史/补全)
 ```
 
-`rust_socketio` 支持 Socket.IO 协议 v5(对应 Engine.IO v4),满足 OGS 服务端要求的最低协议版本。
+OGS 的 Realtime 接口不是 Socket.IO:它是纯 WebSocket,`[command, data, id]` 下发、`[id, data, error]` 回包(见 `goban` 的 `GobanSocket`)。
 
 ---
 
@@ -107,7 +107,7 @@ ogs-tui/
 ├── transport/
 │   ├── auth.rs           # OAuth2 PKCE + JWT
 │   ├── rest_client.rs
-│   └── realtime_client.rs # socket.io 封装,含心跳/重连
+│   └── realtime_client.rs # WebSocket 封装,含心跳/重连
 ├── engine/
 │   ├── board.rs
 │   ├── coord.rs           # 坐标解析与校验

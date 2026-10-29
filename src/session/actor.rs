@@ -10,6 +10,7 @@
 use crate::config::{self, StoredCredentials};
 use crate::engine::board::Color;
 use crate::engine::coord::Coord;
+use crate::engine::rules::{RuleSet, SUPPORTED_SIZES};
 use crate::engine::sgf::SgfGame;
 use crate::session::event_bus::EventBus;
 use crate::session::store::{
@@ -69,9 +70,11 @@ pub enum Command {
     FetchChannels,
     OpenGame(u64),
     CloseGame(u64),
-    SetBoardSize {
-        game_id: Option<u64>,
+    /// Starts a local 摆谱 game, optionally replaying opening moves.
+    NewLocalGame {
         size: u8,
+        rules: RuleSet,
+        moves: Vec<Coord>,
     },
     LoadSgf(u64),
     LoadSgfFile {
@@ -392,36 +395,8 @@ impl Actor {
             Command::FetchChannels => self.spawn_channels(),
             Command::OpenGame(game_id) => self.open_game(game_id).await,
             Command::CloseGame(game_id) => self.close_game(game_id).await,
-            Command::SetBoardSize { game_id, size } => {
-                if ![9u8, 13, 19].contains(&size) {
-                    self.log(
-                        LogLevel::Error,
-                        format!("invalid board size {size}; supported sizes are 9, 13, 19"),
-                    )
-                    .await;
-                } else {
-                    let target_id = {
-                        let mut state = self.state.write().await;
-                        let id = game_id
-                            .or(state.active_game)
-                            .unwrap_or(42);
-                        let mut view = GameView::empty(id, size);
-                        if let Some(username) = &state.username {
-                            view.black = username.clone();
-                        }
-                        view.white = "local-board".to_string();
-                        view.our_color = Some(Color::Black);
-                        view.connected = false;
-                        state.games.insert(id, view);
-                        state.switch_to_game(id);
-                        id
-                    };
-                    self.log(
-                        LogLevel::Success,
-                        format!("game {target_id}: board size set to {size}x{size} (standard Go rules active)"),
-                    )
-                    .await;
-                }
+            Command::NewLocalGame { size, rules, moves } => {
+                self.new_local_game(size, rules, moves).await;
             }
             Command::LoadSgf(game_id) => self.spawn_sgf(game_id),
             Command::LoadSgfFile { path } => self.load_sgf_file(path).await,
@@ -452,15 +427,25 @@ impl Actor {
                         let mut state = self.state.write().await;
                         state.game_mut(game_id).map(|g| {
                             let color = g.play_local_pass();
-                            (color, g.move_number())
+                            // Two passes in a row end a local game: count it.
+                            let finished = g.local && g.game.is_finished();
+                            (color, g.move_number(), finished)
                         })
                     };
-                    if let Some((color, move_no)) = passed {
+                    if let Some((color, move_no, finished)) = passed {
                         self.log(
                             LogLevel::Success,
                             format!("game {game_id}: move #{move_no} {color:?} passed (ko cleared)"),
                         )
                         .await;
+                        if finished {
+                            self.log(
+                                LogLevel::Info,
+                                format!("game {game_id}: both passed — counting…"),
+                            )
+                            .await;
+                            self.spawn_auto_count(game_id, true);
+                        }
                     } else {
                         self.offline_warning("pass").await;
                     }
@@ -479,6 +464,27 @@ impl Actor {
                 game_id,
                 move_number,
             } => {
+                let local_undo = {
+                    let mut state = self.state.write().await;
+                    match state.game_mut(game_id) {
+                        Some(game) if game.local => Some(game.undo_local()),
+                        _ => None,
+                    }
+                };
+                if let Some(removed) = local_undo {
+                    match removed {
+                        Some(mv) => {
+                            let what = mv.coord.map_or_else(|| "pass".to_string(), Coord::to_gtp);
+                            self.log(
+                                LogLevel::Info,
+                                format!("game {game_id}: took back move #{} ({what})", mv.number),
+                            )
+                            .await;
+                        }
+                        None => self.log(LogLevel::Warning, "nothing to undo").await,
+                    }
+                    return true;
+                }
                 let number = match move_number {
                     Some(number) => number,
                     None => self
@@ -666,15 +672,6 @@ impl Actor {
                     state.user_id = user_id;
                     state.connection = crate::session::store::ConnectionState::Connecting;
                     state.connection_message = None;
-                    if state.games.is_empty() && state.active_game.is_none() {
-                        let mut view = GameView::empty(42, 9);
-                        view.black = bootstrap.username.clone();
-                        view.white = "local-board".to_string();
-                        view.our_color = Some(Color::Black);
-                        view.connected = false;
-                        state.games.insert(42, view);
-                        state.active_game = Some(42);
-                    }
                 }
                 self.auth = Some(bootstrap.auth.clone());
                 self.rest = Some(Arc::new(RestClient::new(bootstrap.auth.clone())));
@@ -773,6 +770,48 @@ impl Actor {
     }
 
     // --------------------------------------------------------------- games
+
+    async fn new_local_game(&mut self, size: u8, rules: RuleSet, moves: Vec<Coord>) {
+        if !SUPPORTED_SIZES.contains(&size) {
+            self.log(
+                LogLevel::Error,
+                format!("invalid board size {size}; supported sizes are 9, 13, 19"),
+            )
+            .await;
+            return;
+        }
+        let (id, failed) = {
+            let mut state = self.state.write().await;
+            let id = state.next_local_game_id();
+            let mut view = GameView::local(id, size, rules);
+            view.black = "Black".to_string();
+            view.white = "White".to_string();
+            let mut failed = None;
+            for coord in moves {
+                if let Err(error) = view.play_local_move(coord) {
+                    failed = Some(format!("{} — {error}", coord.to_gtp()));
+                    break;
+                }
+            }
+            state.games.insert(id, view);
+            state.active_game = Some(id);
+            state.switch_to_game(id);
+            (id, failed)
+        };
+        if let Some(failed) = failed {
+            self.log(LogLevel::Error, format!("game {id}: opening move rejected: {failed}"))
+                .await;
+        }
+        self.log(
+            LogLevel::Success,
+            format!(
+                "摆谱 game {id}: {size}x{size}, {}, komi {}. Black to play.",
+                rules.label(),
+                rules.default_komi()
+            ),
+        )
+        .await;
+    }
 
     async fn open_game(&mut self, game_id: u64) {
         let mut state = self.state.write().await;
@@ -949,6 +988,17 @@ impl Actor {
                 .unwrap_or_else(|_| self.config.world_channel.clone())
         });
         if let Some(realtime) = &self.realtime {
+            if !realtime.is_authenticated() {
+                self.log(
+                    LogLevel::Error,
+                    format!(
+                        "not sent to #{channel}: the socket is not authenticated yet \
+                         (wait for “authenticated” in the status bar, or run `connect`)"
+                    ),
+                )
+                .await;
+                return;
+            }
             if let Some(game_id) = channel
                 .strip_prefix("game/")
                 .and_then(|id| id.parse::<u64>().ok())
@@ -961,13 +1011,18 @@ impl Actor {
                     .map(|game| i64::from(game.move_number()))
                     .unwrap_or(0);
                 realtime.game_chat(game_id as i64, move_number, &text);
+                self.state
+                    .write()
+                    .await
+                    .push_system_chat(&channel, format!("you: {text}"));
             } else {
                 realtime.send_chat(&channel, &text);
+                let mut state = self.state.write().await;
+                let me = state.username.clone().unwrap_or_else(|| "you".to_string());
+                let key = crate::session::store::canonical_channel_key(&channel);
+                state.set_channel_joined(&key, true);
+                state.push_chat(&key, &me, &text);
             }
-            self.state
-                .write()
-                .await
-                .push_system_chat(&channel, format!("you: {text}"));
         } else {
             self.offline_warning("chat").await;
         }
@@ -1064,6 +1119,9 @@ impl Actor {
     }
 
     async fn save_sgf_file(&mut self, game_id: u64, path: String) {
+        let path = sgf_save_path(&path, game_id)
+            .to_string_lossy()
+            .into_owned();
         let sgf_text = {
             let state = self.state.read().await;
             match state.game(game_id) {
@@ -1124,26 +1182,61 @@ impl Actor {
     // ----------------------------------------------------------- estimate
 
     async fn estimate_auto(&mut self, game_id: u64) {
-        let outcome = {
-            let mut state = self.state.write().await;
-            let Some(game) = state.game_mut(game_id) else {
-                drop(state);
-                self.log(LogLevel::Warning, format!("game {game_id} is not open"))
-                    .await;
+        if self.state.read().await.game(game_id).is_none() {
+            self.log(LogLevel::Warning, format!("game {game_id} is not open"))
+                .await;
+            return;
+        }
+        self.spawn_auto_count(game_id, false);
+    }
+
+    /// Runs Monte-Carlo dead-stone detection on a worker thread and applies
+    /// it to the store afterwards. Detection on 19×19 takes a noticeable
+    /// moment, and the store lock must never be held that long.
+    fn spawn_auto_count(&self, game_id: u64, game_over: bool) {
+        let state = Arc::clone(&self.state);
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let Some(board) = state.read().await.game(game_id).map(|g| g.board().clone()) else {
                 return;
             };
-            let summary = game.auto_estimate();
-            let dead = game.estimate_dead.len();
-            (summary, dead)
-        };
-        let (summary, dead) = outcome;
-        self.log(
-            LogLevel::Success,
-            format!(
-                "Monte-Carlo auto estimate: {summary} ({dead} dead stone(s) detected; toggle groups with [a10] or `estimate confirm`)"
-            ),
-        )
-        .await;
+            let probe = board.clone();
+            let Ok(dead) = tokio::task::spawn_blocking(move || {
+                crate::engine::estimate::auto_detect_dead(
+                    &probe,
+                    crate::engine::estimate::DEFAULT_PLAYOUTS,
+                )
+            })
+            .await
+            else {
+                return;
+            };
+            let outcome = {
+                let mut store = state.write().await;
+                match store.game_mut(game_id) {
+                    // Discard the result if a move or undo changed the board meanwhile.
+                    Some(game) if game.board() == &board => {
+                        let count = dead.len();
+                        Some((game.apply_auto_dead(dead), count))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((summary, count)) = outcome {
+                let text = if game_over {
+                    format!(
+                        "game {game_id}: result {summary} ({count} dead stone(s)). \
+                         Click a group to toggle dead/alive; `undo` resumes play."
+                    )
+                } else {
+                    format!(
+                        "Monte-Carlo auto estimate: {summary} ({count} dead stone(s) detected; \
+                         toggle groups with [a10] or `estimate confirm`)"
+                    )
+                };
+                let _ = tx.send(Command::Log { level: LogLevel::Success, text });
+            }
+        });
     }
 
     async fn estimate_confirm(&mut self, game_id: u64) {
@@ -1283,7 +1376,8 @@ impl Actor {
                 }
                 self.event_bus.publish("connected", &Value::Null).await;
                 self.log(LogLevel::Info, "realtime socket connected").await;
-                self.join_world_channel().await;
+                // Channels are joined once the server has accepted the JWT
+                // (see `Authenticated`), so OGS lists us under our account.
             }
             RealtimeEvent::Disconnected => {
                 {
@@ -1322,7 +1416,14 @@ impl Actor {
                     realtime.gamelist_count_subscribe(Some("live"));
                     realtime.stats_online(60);
                     realtime.query_game_list(GameList::Live, json!({}), 0, 30);
-                    let active = self.state.read().await.active_game;
+                    let active = {
+                        let state = self.state.read().await;
+                        // Only real OGS games are streamed; 摆谱 and SGF
+                        // boards exist only on this machine.
+                        state
+                            .active_game
+                            .filter(|id| state.game(*id).is_some_and(|game| !game.local))
+                    };
                     if let Some(game_id) = active {
                         realtime.connect_to_game(game_id as i64);
                     }
@@ -1340,6 +1441,9 @@ impl Actor {
                     .unwrap_or("unknown");
                 self.log(LogLevel::Info, format!("OGS server version {version}"))
                     .await;
+            }
+            RealtimeEvent::ActiveBots(bots) => {
+                self.state.write().await.apply_active_bots(&bots);
             }
             RealtimeEvent::Notification(note) => {
                 self.event_bus.publish("notification", &note).await;
@@ -2330,6 +2434,24 @@ async fn bootstrap(
     })
 }
 
+/// Where `sgf save <path>` writes: a directory gets a file named after the
+/// game inside it, and a missing extension becomes `.sgf`.
+fn sgf_save_path(path: &str, game_id: u64) -> PathBuf {
+    let typed = PathBuf::from(path);
+    if path.ends_with('/') || typed.is_dir() {
+        let name = if game_id >= crate::session::store::LOCAL_GAME_ID_BASE {
+            format!("baipu-{}.sgf", game_id - crate::session::store::LOCAL_GAME_ID_BASE + 1)
+        } else {
+            format!("ogs-{game_id}.sgf")
+        };
+        return typed.join(name);
+    }
+    if typed.extension().is_none() {
+        return typed.with_extension("sgf");
+    }
+    typed
+}
+
 fn game_id_from_event(event: &str) -> Option<u64> {
     event
         .strip_prefix("game/")?
@@ -2453,6 +2575,126 @@ mod tests {
                     .unwrap_or(false))
                 .await
         );
+    }
+
+    #[tokio::test]
+    async fn local_game_plays_counts_after_two_passes_and_undoes() {
+        let handle = SessionHandle::spawn_with_store(config(), Store::new("en"));
+        handle.send(Command::NewLocalGame {
+            size: 13,
+            rules: RuleSet::JapaneseKorean,
+            moves: vec![Coord::new(3, 3)],
+        });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| store
+                    .focused_game()
+                    .is_some_and(|game| game.local && game.move_number() == 1))
+                .await
+        );
+        let store = handle.snapshot().await;
+        let game_id = store.active_game.unwrap();
+        let game = store.game(game_id).unwrap();
+        assert!(game_id >= crate::session::store::LOCAL_GAME_ID_BASE);
+        assert_eq!((game.size, game.komi), (13, 6.5));
+        assert_eq!(game.rule_set(), RuleSet::JapaneseKorean);
+        assert_eq!(game.to_play(), Color::White);
+
+        handle.send(Command::PlayMove { game_id, coord: Coord::new(9, 9) });
+        handle.send(Command::Pass { game_id });
+        handle.send(Command::Pass { game_id });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(30), |store| store
+                    .game(game_id)
+                    .is_some_and(|game| game.estimate_active && game.estimate_summary.is_some()))
+                .await,
+            "two passes start counting"
+        );
+
+        handle.send(Command::UndoRequest { game_id, move_number: None });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| store
+                    .game(game_id)
+                    .is_some_and(|game| !game.estimate_active && game.move_number() == 3))
+                .await,
+            "undo takes back the last pass and resumes play"
+        );
+    }
+
+    #[tokio::test]
+    async fn sgf_export_keeps_rules_and_komi_and_reimports() {
+        let dir = std::env::temp_dir().join(format!("ogs-tui-sgf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let handle = SessionHandle::spawn_with_store(config(), Store::new("en"));
+        handle.send(Command::NewLocalGame {
+            size: 9,
+            rules: RuleSet::AncientChinese,
+            moves: vec![Coord::new(2, 2), Coord::new(6, 6)],
+        });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| store
+                    .focused_game()
+                    .is_some_and(|game| game.move_number() == 2))
+                .await
+        );
+        let game_id = handle.snapshot().await.active_game.unwrap();
+        // A directory path gets a file named after the game.
+        handle.send(Command::SaveSgfFile {
+            game_id,
+            path: format!("{}/", dir.display()),
+        });
+        let file = dir.join("baipu-1.sgf");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("RU[Ancient Chinese]"), "{text}");
+        assert!(text.contains("KM[0]"), "{text}");
+        assert!(text.contains("SZ[9]"), "{text}");
+
+        handle.send(Command::LoadSgfFile { path: file.display().to_string() });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| store
+                    .logs
+                    .iter()
+                    .any(|line| line.text.contains("loaded SGF")))
+                .await
+        );
+        let store = handle.snapshot().await;
+        let loaded = store.focused_game().unwrap();
+        assert_eq!(loaded.rule_set(), RuleSet::AncientChinese);
+        assert_eq!(loaded.komi, 0.0);
+        assert_eq!(loaded.move_number(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sgf_save_paths_get_a_name_and_extension() {
+        let local = crate::session::store::LOCAL_GAME_ID_BASE;
+        assert_eq!(sgf_save_path("/tmp/", local), PathBuf::from("/tmp/baipu-1.sgf"));
+        assert_eq!(sgf_save_path("/x/y/game", 5), PathBuf::from("/x/y/game.sgf"));
+        assert_eq!(sgf_save_path("/x/y/game.SGF", 5), PathBuf::from("/x/y/game.SGF"));
+        assert_eq!(sgf_save_path("out/", 77), PathBuf::from("out/ogs-77.sgf"));
+    }
+
+    #[tokio::test]
+    async fn local_game_rejects_unsupported_sizes() {
+        let handle = SessionHandle::spawn_with_store(config(), Store::new("en"));
+        handle.send(Command::NewLocalGame { size: 11, rules: RuleSet::Chinese, moves: Vec::new() });
+        assert!(
+            handle
+                .wait_for(Duration::from_secs(1), |store| store
+                    .logs
+                    .iter()
+                    .any(|line| line.text.contains("invalid board size 11")))
+                .await
+        );
+        assert!(handle.snapshot().await.games.is_empty());
     }
 
     #[tokio::test]

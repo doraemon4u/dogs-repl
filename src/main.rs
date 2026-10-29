@@ -295,7 +295,7 @@ async fn smoke(username: &str, password: &str) -> Result<(), String> {
         None => println!("      user_jwt is opaque (no decodable claims), continuing"),
     }
 
-    println!("[4/4] Socket.IO connect + authenticate (up to 45 s)");
+    println!("[4/4] WebSocket connect + authenticate (up to 45 s)");
     let mut client = RealtimeClient::new(jwt);
     let mut events = client
         .take_event_receiver()

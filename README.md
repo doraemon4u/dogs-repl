@@ -8,7 +8,7 @@ Terminal REPL / TUI client for [Online-Go.com](https://online-go.com) (OGS) writ
 - **Async Session Layer**: Single-owner Actor model (`tokio`), monotonic store state, real-time event distribution, and official scoring agreement synchronization.
 - **Transport Layer**:
   - Full REST client with exponential backoff on HTTP 429/5xx.
-  - Socket.IO / WebSocket Realtime client matching the official `online-go/goban` protocol.
+  - Realtime client over a plain WebSocket (`wss://online-go.com`, JSON-array frames), matching the official `online-go/goban` `GobanSocket`.
   - Heartbeat (`net/ping` / `net/pong`) and automatic reconnect with state preservation.
 - **Terminal UI**:
   - Interactive ratatui TUI with responsive board layout, dynamic resizing, and ANSI/256/Truecolor support.

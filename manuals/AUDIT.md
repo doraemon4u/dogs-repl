@@ -36,6 +36,8 @@
 - [x] **已解决**:在 `src/transport/rest_client.rs` 中实现了针对 HTTP 429 与 5xx 的自适应退避与重试机制(`retry_with_backoff`),并覆盖了单元测试。
 
 ### 6. `rust_socketio` 与 OGS 实际协议版本的兼容性只是假设,缺验证步骤
+- [x] **2026-10 更正**:OGS Realtime 不是 Socket.IO,而是 `wss://online-go.com` 上的纯 WebSocket,每条消息是一个 JSON 数组(与 `goban` 的 `GobanSocket` 一致)。Socket.IO 帧下服务器仍会推送聊天,但从不应答请求,导致 `authenticate` 永远收不到回包、登录后无法在世界频道发言。已改用 `tokio-tungstenite` 直连,`authenticate` 在每次(重)连后最先发送,认证成功后才加入频道。
+- [x] **2026-10 频道聊天确认**:实测 OGS 会把 `chat/send` 转发给频道里的其他人,但**从不回显给发送方的 socket**,所以原先"等待自己的回显、10 秒没等到就报 `not confirmed`"每次都误报(消息其实已发出,游客连接能在频道历史里看到)。现在 `chat/send` 带请求 id 发送,以服务器的 `[rid, null, null]` 回包作为确认,`[rid, null, error]` 时显示拒绝原因,10 秒无回包才警告。消息 id 改为与网页客户端 `chatSoftUid` 相同的格式(62 进制用户 id + `.` + 62 进制毫秒时间戳):旧的 `ogs-tui-N` 每次启动从头计数,会与频道历史里已有的 id 重复,而客户端会丢弃 id 已见过的消息。以下旧记录仅供参考。
 - [x] **已解决**:在 `src/transport/realtime_client.rs` 中明确指定了 `.transport_type(TransportType::Websocket)`,修正了 `[command, data, id]` 与 `[id, data, err]` 首元素数字/字符串分发,注册了单独的 `.on("error")` 拦截,并增加了自动重连后补发 `authenticate` 与 `RealtimeEvent::Connected` 事件机制。
 
 ### 7. 凭证持久化的安全存储方式未设计
