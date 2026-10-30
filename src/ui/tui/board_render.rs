@@ -187,24 +187,14 @@ fn max_fitting_row_step(area: Rect, size: u8) -> u16 {
     best_row_step
 }
 
-/// Computes optimal `(col_step, row_step)` enforcing:
-/// 1. Strict 2:1 character aspect ratio (`col_step == row_step * 2`) so 9x9, 13x13, and 19x19
-///    boards are ALWAYS rendered as a true 1:1 geometric square (正四边形).
-/// 2. Tiered visual hierarchy (`9x9 < 13x13 < 19x19`): smaller road sizes never expand to a
-///    larger grid footprint than larger road sizes in the same viewport.
+/// Computes optimal `(col_step, row_step)` enforcing a strict 2:1 character aspect ratio
+/// (`col_step == row_step * 2`) so 9x9, 13x13, and 19x19 boards are ALWAYS rendered as a
+/// true 1:1 geometric square (正四边形).
 pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
     if size <= 1 {
         return (2, 1);
     }
-    let raw = max_fitting_row_step(area, size);
-    let r19 = max_fitting_row_step(area, 19);
-    let r13 = max_fitting_row_step(area, 13).min(r19);
-    let best_row_step = match size {
-        0..=10 => raw.min(r13),
-        11..=15 => raw.min(r19),
-        _ => raw,
-    };
-
+    let best_row_step = max_fitting_row_step(area, size);
     (best_row_step * 2, best_row_step)
 }
 
@@ -753,33 +743,13 @@ mod tests {
     }
 
     #[test]
-    fn board_size_hierarchy_scales_up_from_9_to_13_to_19() {
-        for &(w, h) in &[
-            (60u16, 24u16),
-            (80, 40),
-            (100, 42),
-            (120, 45),
-            (160, 60),
-        ] {
-            let area = Rect::new(0, 0, w, h);
-            let m9 = compute_metrics(area, 9).expect("9x9 metrics");
-            let m13 = compute_metrics(area, 13).expect("13x13 metrics");
-            let m19 = compute_metrics(area, 19).expect("19x19 metrics");
-            assert!(
-                m9.grid_w < m13.grid_w && m13.grid_w < m19.grid_w,
-                "in {w}x{h}: expected grid_w 9x9 ({}) < 13x13 ({}) < 19x19 ({})",
-                m9.grid_w,
-                m13.grid_w,
-                m19.grid_w
-            );
-            assert!(
-                m9.grid_h < m13.grid_h && m13.grid_h < m19.grid_h,
-                "in {w}x{h}: expected grid_h 9x9 ({}) < 13x13 ({}) < 19x19 ({})",
-                m9.grid_h,
-                m13.grid_h,
-                m19.grid_h
-            );
-        }
+    fn nineteen_board_scales_up_in_standard_panes() {
+        let area = Rect::new(0, 0, 78, 37);
+        let m19 = compute_metrics(area, 19).expect("19x19 metrics");
+        assert_eq!(m19.row_step, 2);
+        assert_eq!(m19.col_step, 4);
+        assert_eq!(m19.grid_w, 72);
+        assert_eq!(m19.grid_h, 36);
     }
 }
 

@@ -133,11 +133,9 @@ const HTML_PAGE = `<!DOCTYPE html>
       min-height: 0;
       transition: grid-template-columns 160ms ease-out;
     }
-    #tui-view[data-size="9"] {
-      grid-template-columns: calc((100% - 12px) * 0.46) minmax(0, 1fr) minmax(0, 1fr);
-    }
+    #tui-view[data-size="9"],
     #tui-view[data-size="13"] {
-      grid-template-columns: calc((100% - 12px) * 0.52) minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-columns: calc((100% - 12px) * 0.46) minmax(0, 1fr) minmax(0, 1fr);
     }
     #tui-view[data-size="19"] {
       grid-template-columns: clamp(460px, calc(100vh - 94px), 68vw) minmax(0, 1fr);
@@ -200,8 +198,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       user-select: none;
     }
     .board-square-wrap {
-      width: min(76cqw, 76cqh);
-      height: min(76cqw, 76cqh);
+      width: min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
       aspect-ratio: 1 / 1;
       display: flex;
       align-items: center;
@@ -214,15 +212,11 @@ const HTML_PAGE = `<!DOCTYPE html>
       flex-shrink: 0;
       transition: width 160ms ease-out, height 160ms ease-out, padding 160ms ease-out;
     }
-    .board-square-wrap[data-size="9"] {
-      width: min(76cqw, 76cqh);
-      height: min(76cqw, 76cqh);
-      padding: 6px;
-    }
+    .board-square-wrap[data-size="9"],
     .board-square-wrap[data-size="13"] {
-      width: min(88cqw, 88cqh);
-      height: min(88cqw, 88cqh);
-      padding: 5px;
+      width: min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
+      padding: 6px;
     }
     .board-square-wrap[data-size="19"] {
       width: min(100cqw, 100cqh);
@@ -1338,28 +1332,28 @@ const HTML_PAGE = `<!DOCTYPE html>
     // - Compact Yunzi stone proportions: 19x19 uses pad=42 (step=50.89px) and stoneR=24.7px (48.54% of step)
     const BOARD_AESTHETIC_PROFILES = {
       9: {
-        scalePct: 76,
-        pad: 86,
-        stoneR: 49.5,
-        strokeB: 3.4,
+        scalePct: 100,
+        pad: 90,
+        stoneR: 47.5,
+        strokeB: 3.5,
         strokeW: 3.0,
-        gridStroke: 2.1,
+        gridStroke: 2.0,
         borderStroke: 3.0,
         fontSize: 25,
-        labelOffsetRatio: 0.36,
+        labelOffsetRatio: 0.35,
         crossArm: 16,
         hoshiStroke: 3.4
       },
       13: {
-        scalePct: 88,
-        pad: 60,
-        stoneR: 35.2,
+        scalePct: 100,
+        pad: 62,
+        stoneR: 34.5,
         strokeB: 2.2,
         strokeW: 2.0,
-        gridStroke: 1.8,
-        borderStroke: 2.8,
+        gridStroke: 2.0,
+        borderStroke: 3.0,
         fontSize: 21,
-        labelOffsetRatio: 0.40,
+        labelOffsetRatio: 0.38,
         crossArm: 11,
         hoshiStroke: 3.0
       },

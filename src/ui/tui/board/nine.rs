@@ -17,6 +17,6 @@ impl BoardStyle for Nine {
     }
 
     fn max_row_step(&self) -> u16 {
-        3
+        6
     }
 }
