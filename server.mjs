@@ -140,7 +140,16 @@ const HTML_PAGE = `<!DOCTYPE html>
       grid-template-columns: calc((100% - 12px) * 0.52) minmax(0, 1fr) minmax(0, 1fr);
     }
     #tui-view[data-size="19"] {
-      grid-template-columns: calc((100% - 12px) * 0.60) minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-columns: clamp(460px, calc(100vh - 94px), 68vw) minmax(0, 1fr);
+      grid-template-rows: 52% 48%;
+      gap: 4px;
+      padding: 4px;
+    }
+    #tui-view[data-size="19"] #pane-board {
+      grid-row: 1 / 3;
+    }
+    #tui-view[data-size="19"] .board-pane .pane-body {
+      padding: 2px;
     }
     .pane {
       background: var(--panel-bg);
@@ -191,9 +200,8 @@ const HTML_PAGE = `<!DOCTYPE html>
       user-select: none;
     }
     .board-square-wrap {
-      --board-scale: 76;
-      width: min(calc(var(--board-scale) * 1cqw), calc(var(--board-scale) * 1cqh));
-      height: min(calc(var(--board-scale) * 1cqw), calc(var(--board-scale) * 1cqh));
+      width: min(76cqw, 76cqh);
+      height: min(76cqw, 76cqh);
       aspect-ratio: 1 / 1;
       display: flex;
       align-items: center;
@@ -207,16 +215,21 @@ const HTML_PAGE = `<!DOCTYPE html>
       transition: width 160ms ease-out, height 160ms ease-out, padding 160ms ease-out;
     }
     .board-square-wrap[data-size="9"] {
-      --board-scale: 76;
+      width: min(76cqw, 76cqh);
+      height: min(76cqw, 76cqh);
       padding: 6px;
     }
     .board-square-wrap[data-size="13"] {
-      --board-scale: 88;
+      width: min(88cqw, 88cqh);
+      height: min(88cqw, 88cqh);
       padding: 5px;
     }
     .board-square-wrap[data-size="19"] {
-      --board-scale: 98;
-      padding: 4px;
+      width: min(100cqw, 100cqh);
+      height: min(100cqw, 100cqh);
+      padding: 0;
+      border-width: 1px;
+      border-radius: 4px;
     }
     .board-svg {
       width: 100%;
@@ -1351,15 +1364,15 @@ const HTML_PAGE = `<!DOCTYPE html>
         hoshiStroke: 3.0
       },
       19: {
-        scalePct: 98,
-        pad: 42,
-        stoneR: 24.7,
+        scalePct: 100,
+        pad: 28,
+        stoneR: 25.5,
         strokeB: 1.15,
         strokeW: 1.1,
-        gridStroke: 1.35,
+        gridStroke: 1.4,
         borderStroke: 2.5,
-        fontSize: 16.5,
-        labelOffsetRatio: 0.45,
+        fontSize: 15.2,
+        labelOffsetRatio: 0.43,
         crossArm: 6.5,
         hoshiStroke: 2.1
       }
@@ -1485,10 +1498,12 @@ const HTML_PAGE = `<!DOCTYPE html>
         </radialGradient>
       </defs>\`;
       // Subtle board surface & outer line frame (外边线条框绘制)
-      svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="8" fill="#0f141c" />\`;
-      // Outer line box frame enclosing board and coordinates
-      svg += \`<rect x="6" y="6" width="\${V - 12}" height="\${V - 12}" rx="5" fill="none" stroke="#58a6ff" stroke-width="2.2" />\`;
-      svg += \`<rect x="11" y="11" width="\${V - 22}" height="\${V - 22}" rx="3.5" fill="none" stroke="#21262d" stroke-width="1.1" />\`;
+      svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="\${size === 19 ? '4' : '8'}" fill="#0f141c" />\`;
+      if (size !== 19) {
+        // Outer line box frame enclosing board and coordinates for 9x9 and 13x13
+        svg += \`<rect x="6" y="6" width="\${V - 12}" height="\${V - 12}" rx="5" fill="none" stroke="#58a6ff" stroke-width="2.2" />\`;
+        svg += \`<rect x="11" y="11" width="\${V - 22}" height="\${V - 22}" rx="3.5" fill="none" stroke="#21262d" stroke-width="1.1" />\`;
+      }
 
       // Coordinate labels (Top, Bottom, Left, Right) positioned at the optical midpoint of the margin
       const labelPos = (pad * profile.labelOffsetRatio).toFixed(2);

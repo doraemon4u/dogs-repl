@@ -95,10 +95,11 @@ pub fn too_small(area: Rect, scene: Scene) -> Option<(u16, u16)> {
 
 /// Splits the game screen into header, board, moves, chat, status, and input.
 ///
-/// The board pane is always exactly half the window's width (the left
-/// half, rounded down for odd widths) and the full height between the header
-/// and the status line. The board itself is drawn as large as fits inside it.
-pub fn split_game(area: Rect, _board_size: u8) -> GameLayout {
+/// For 9×9 and 13×13, the board pane is half the window's width. For 19×19,
+/// when the window has spare width beyond the minimum side panel width, the
+/// board pane expands proportionally (up to 80 columns) so the 19×19 grid can
+/// render at full scale instead of sitting small and centered.
+pub fn split_game(area: Rect, board_size: u8) -> GameLayout {
     let vertical = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -112,7 +113,12 @@ pub fn split_game(area: Rect, _board_size: u8) -> GameLayout {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(bottom);
-    let board_width = area.width / 2;
+    let half = area.width / 2;
+    let board_width = if board_size >= 19 && area.width >= 80 + SIDE_PANEL_MIN_WIDTH {
+        half.max(80.min(area.width.saturating_sub(SIDE_PANEL_MIN_WIDTH)))
+    } else {
+        half
+    };
     let horizontal = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(board_width), Constraint::Min(0)])
@@ -206,8 +212,12 @@ mod tests {
     #[test]
     fn game_layout_fits_and_sizes_the_board_per_size() {
         let area = Rect::new(0, 0, 120, 40);
+        let layout9 = split_game(area, 9);
+        let layout13 = split_game(area, 13);
         let layout = split_game(area, 19);
-        assert_eq!(layout.board.width, 60, "board pane is half the window");
+        assert_eq!(layout9.board.width, 60);
+        assert_eq!(layout13.board.width, 60);
+        assert_eq!(layout.board.width, 80, "19x19 board pane scales up proportionally");
         assert!(area.width - layout.board.width >= SIDE_PANEL_MIN_WIDTH);
         assert_eq!(layout.board.x, 0);
         assert_eq!(layout.status.height, 1);
@@ -245,9 +255,14 @@ mod tests {
                 let h = h.max(min_h);
                 let area = Rect::new(0, 0, w, h);
                 let layout = split_game(area, size);
-                assert_eq!(layout.board.width, w / 2, "{size}x{size} in {w}x{h}");
-                assert_eq!(layout.moves.x, w / 2, "side column starts at the middle");
-                assert_eq!(layout.moves.width, w - w / 2);
+                let expected_w = if size >= 19 && w >= 80 + SIDE_PANEL_MIN_WIDTH {
+                    (w / 2).max(80.min(w - SIDE_PANEL_MIN_WIDTH))
+                } else {
+                    w / 2
+                };
+                assert_eq!(layout.board.width, expected_w, "{size}x{size} in {w}x{h}");
+                assert_eq!(layout.moves.x, expected_w, "side column starts after board");
+                assert_eq!(layout.moves.width, w - expected_w);
                 assert_eq!(layout.board.height, h - 1 - INPUT_ROWS);
                 // At the minimum size the side column is still usable.
                 assert!(layout.moves.width >= SIDE_PANEL_MIN_WIDTH);

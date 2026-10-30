@@ -166,11 +166,18 @@ fn max_fitting_row_step(area: Rect, size: u8) -> u16 {
     for r in 1..=style_or_nearest(size).max_row_step() {
         let c = r * 2;
         let (rx, ry) = stone_radii_for_size(size, c, r);
-        let needed_w = LABEL_WIDTH + rx * 2 + gaps * c + 1;
-        // For 19x19, allow full-scale step r >= 2 as soon as the grid + stone
-        // extents fit vertically; smaller boards also reserve a top label row.
-        let label_row = u16::from(r > 1 && size < 19);
-        let needed_h = gaps * r + 1 + ry * 2 + label_row;
+        let (needed_w, needed_h) = if size >= 19 && r == 2 {
+            // Allow 19x19 full-scale (72x36) to activate as soon as 77x37 inner area
+            // is available (e.g. a 120x42 terminal) so it fills the pane instead of
+            // collapsing to a centered 36x18 mini-board.
+            (LABEL_WIDTH + 1 + gaps * c + 1, gaps * r + 1)
+        } else {
+            let label_row = u16::from(r > 1 && size < 19);
+            (
+                LABEL_WIDTH + rx * 2 + gaps * c + 1,
+                gaps * r + 1 + ry * 2 + label_row,
+            )
+        };
         if needed_w <= area.width && needed_h <= area.height {
             best_row_step = r;
         } else {
@@ -230,7 +237,18 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
     let grid_w = gaps * col_step;
     let grid_h = gaps * row_step;
 
-    let min_w = LABEL_WIDTH + stone_rx + grid_w + stone_rx + 1;
+    let full_min_w = LABEL_WIDTH + stone_rx + grid_w + stone_rx + 1;
+    let left_pad = if area.width >= full_min_w {
+        stone_rx
+    } else {
+        stone_rx.min(1)
+    };
+    let right_pad = if area.width >= LABEL_WIDTH + left_pad + grid_w + stone_rx + 1 {
+        stone_rx
+    } else {
+        0
+    };
+    let min_w = LABEL_WIDTH + left_pad + grid_w + right_pad + 1;
     let min_h = grid_h + 1;
     if area.width < min_w || area.height < min_h {
         return None;
@@ -272,13 +290,13 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
 
     let origin_x = area.x + area.width.saturating_sub(total_w) / 2;
     let origin_y = area.y + area.height.saturating_sub(total_h) / 2;
-    let grid_x0 = origin_x + LABEL_WIDTH + stone_rx;
+    let grid_x0 = origin_x + LABEL_WIDTH + left_pad;
     let grid_y0 = origin_y + top_pad;
 
     Some(BoardMetrics {
         col_step,
         row_step,
-        stone_rx,
+        stone_rx: right_pad,
         stone_ry,
         origin_x,
         origin_y,
@@ -416,6 +434,16 @@ pub fn draw_board(
             if row_index + 1 < size && m.row_step > 1 {
                 for k in 1..m.row_step {
                     buffer.set_string(x, y + k, "│", grid_line_style);
+                }
+            }
+            if row_index == 0 && !m.show_top_coords && !m.show_bottom_coords && m.col_step >= 2 {
+                if let Some(letter) = Board::letter_for_col(col) {
+                    let lx = if x + 1 < area.x + area.width {
+                        x + 1
+                    } else {
+                        x.saturating_sub(1)
+                    };
+                    buffer.set_string(lx, y, letter.to_string(), header_style);
                 }
             }
         }
