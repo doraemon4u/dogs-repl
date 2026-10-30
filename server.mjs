@@ -127,10 +127,20 @@ const HTML_PAGE = `<!DOCTYPE html>
     #tui-view {
       flex: 1;
       display: grid;
-      grid-template-columns: calc((100% - 12px) * 2 / 3) minmax(0, 1fr) minmax(0, 1fr);
+      grid-template-columns: calc((100% - 12px) * 0.46) minmax(0, 1fr) minmax(0, 1fr);
       gap: 6px;
       padding: 6px;
       min-height: 0;
+      transition: grid-template-columns 160ms ease-out;
+    }
+    #tui-view[data-size="9"] {
+      grid-template-columns: calc((100% - 12px) * 0.46) minmax(0, 1fr) minmax(0, 1fr);
+    }
+    #tui-view[data-size="13"] {
+      grid-template-columns: calc((100% - 12px) * 0.52) minmax(0, 1fr) minmax(0, 1fr);
+    }
+    #tui-view[data-size="19"] {
+      grid-template-columns: calc((100% - 12px) * 0.60) minmax(0, 1fr) minmax(0, 1fr);
     }
     .pane {
       background: var(--panel-bg);
@@ -181,8 +191,9 @@ const HTML_PAGE = `<!DOCTYPE html>
       user-select: none;
     }
     .board-square-wrap {
-      width: min(100cqw, 100cqh);
-      height: min(100cqw, 100cqh);
+      --board-scale: 76;
+      width: min(calc(var(--board-scale) * 1cqw), calc(var(--board-scale) * 1cqh));
+      height: min(calc(var(--board-scale) * 1cqw), calc(var(--board-scale) * 1cqh));
       aspect-ratio: 1 / 1;
       display: flex;
       align-items: center;
@@ -193,6 +204,19 @@ const HTML_PAGE = `<!DOCTYPE html>
       border-radius: 6px;
       padding: 6px;
       flex-shrink: 0;
+      transition: width 160ms ease-out, height 160ms ease-out, padding 160ms ease-out;
+    }
+    .board-square-wrap[data-size="9"] {
+      --board-scale: 76;
+      padding: 6px;
+    }
+    .board-square-wrap[data-size="13"] {
+      --board-scale: 88;
+      padding: 5px;
+    }
+    .board-square-wrap[data-size="19"] {
+      --board-scale: 98;
+      padding: 4px;
     }
     .board-svg {
       width: 100%;
@@ -1296,14 +1320,60 @@ const HTML_PAGE = `<!DOCTYPE html>
       return false;
     }
 
+    // Calibrated aesthetic profiles for 9, 13, and 19 road Go boards:
+    // - Tiered canvas scale: 9x9 (76%), 13x13 (88%), 19x19 (98%)
+    // - Compact Yunzi stone proportions: 19x19 uses pad=42 (step=50.89px) and stoneR=24.7px (48.54% of step)
+    const BOARD_AESTHETIC_PROFILES = {
+      9: {
+        scalePct: 76,
+        pad: 86,
+        stoneR: 49.5,
+        strokeB: 3.4,
+        strokeW: 3.0,
+        gridStroke: 2.1,
+        borderStroke: 3.0,
+        fontSize: 25,
+        labelOffsetRatio: 0.36,
+        crossArm: 16,
+        hoshiStroke: 3.4
+      },
+      13: {
+        scalePct: 88,
+        pad: 60,
+        stoneR: 35.2,
+        strokeB: 2.2,
+        strokeW: 2.0,
+        gridStroke: 1.8,
+        borderStroke: 2.8,
+        fontSize: 21,
+        labelOffsetRatio: 0.40,
+        crossArm: 11,
+        hoshiStroke: 3.0
+      },
+      19: {
+        scalePct: 98,
+        pad: 42,
+        stoneR: 24.7,
+        strokeB: 1.15,
+        strokeW: 1.1,
+        gridStroke: 1.35,
+        borderStroke: 2.5,
+        fontSize: 16.5,
+        labelOffsetRatio: 0.45,
+        crossArm: 6.5,
+        hoshiStroke: 2.1
+      }
+    };
+
     // Dedicated decoupled stone renderers for 9, 13, and 19 road Go boards
     function renderStoneSvg9x9(x, y, stone, isLast, isDead, isKo, toPlay, est, r, c) {
-      const stoneR = 49.0;
+      const p = BOARD_AESTHETIC_PROFILES[9];
+      const stoneR = p.stoneR;
       let svg = '';
       if (stone === 'B') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="3.6" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="\${p.strokeB}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (stone === 'W') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="3.2" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="\${p.strokeW}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (isKo) {
         svg += \`<rect x="\${(x - 28).toFixed(2)}" y="\${(y - 28).toFixed(2)}" width="56" height="56" fill="rgba(248, 81, 73, 0.22)" stroke="#e3b341" stroke-width="3.2" />\`;
       } else if (est && est.territory[r - 1][c] === 'B') {
@@ -1329,12 +1399,13 @@ const HTML_PAGE = `<!DOCTYPE html>
     }
 
     function renderStoneSvg13x13(x, y, stone, isLast, isDead, isKo, toPlay, est, r, c) {
-      const stoneR = 34.6;
+      const p = BOARD_AESTHETIC_PROFILES[13];
+      const stoneR = p.stoneR;
       let svg = '';
       if (stone === 'B') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="2.4" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="\${p.strokeB}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (stone === 'W') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="2.2" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="\${p.strokeW}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (isKo) {
         svg += \`<rect x="\${(x - 20).toFixed(2)}" y="\${(y - 20).toFixed(2)}" width="40" height="40" fill="rgba(248, 81, 73, 0.22)" stroke="#e3b341" stroke-width="2.8" />\`;
       } else if (est && est.territory[r - 1][c] === 'B') {
@@ -1343,7 +1414,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         svg += \`<rect x="\${(x - 13).toFixed(2)}" y="\${(y - 13).toFixed(2)}" width="26" height="26" fill="#d2a8ff" />\`;
       } else {
         const hoverStroke = toPlay === 'B' ? '#58a6ff' : '#f0f6fc';
-        svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="27" fill="none" stroke="\${hoverStroke}" stroke-width="2.0" stroke-dasharray="4 3" />\`;
+        svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="28" fill="none" stroke="\${hoverStroke}" stroke-width="2.0" stroke-dasharray="4 3" />\`;
       }
 
       if (isDead && stone) {
@@ -1359,42 +1430,46 @@ const HTML_PAGE = `<!DOCTYPE html>
     }
 
     function renderStoneSvg19x19(x, y, stone, isLast, isDead, isKo, toPlay, est, r, c) {
-      const stoneR = 23.3;
+      const p = BOARD_AESTHETIC_PROFILES[19];
+      // Yunzi 48.54% radius ratio (stoneR=24.7px on 50.89px step, 1.49px micro-gap between adjacent stones)
+      const stoneR = p.stoneR;
       let svg = '';
       if (stone === 'B') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="1.5" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#blackStoneGrad)" stroke="#58a6ff" stroke-width="\${p.strokeB}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (stone === 'W') {
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="1.4" opacity="\${isDead ? '0.42' : '1'}" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="\${stoneR}" fill="url(#whiteStoneGrad)" stroke="#8b949e" stroke-width="\${p.strokeW}" opacity="\${isDead ? '0.42' : '1'}" />\`;
       } else if (isKo) {
-        svg += \`<rect x="\${(x - 13).toFixed(2)}" y="\${(y - 13).toFixed(2)}" width="26" height="26" fill="rgba(248, 81, 73, 0.22)" stroke="#e3b341" stroke-width="2.0" />\`;
+        svg += \`<rect x="\${(x - 13.5).toFixed(2)}" y="\${(y - 13.5).toFixed(2)}" width="27" height="27" fill="rgba(248, 81, 73, 0.22)" stroke="#e3b341" stroke-width="2.0" />\`;
       } else if (est && est.territory[r - 1][c] === 'B') {
-        svg += \`<rect x="\${(x - 8).toFixed(2)}" y="\${(y - 8).toFixed(2)}" width="16" height="16" fill="#388bfd" />\`;
+        svg += \`<rect x="\${(x - 8.5).toFixed(2)}" y="\${(y - 8.5).toFixed(2)}" width="17" height="17" fill="#388bfd" />\`;
       } else if (est && est.territory[r - 1][c] === 'W') {
-        svg += \`<rect x="\${(x - 8).toFixed(2)}" y="\${(y - 8).toFixed(2)}" width="16" height="16" fill="#d2a8ff" />\`;
+        svg += \`<rect x="\${(x - 8.5).toFixed(2)}" y="\${(y - 8.5).toFixed(2)}" width="17" height="17" fill="#d2a8ff" />\`;
       } else {
         const hoverStroke = toPlay === 'B' ? '#58a6ff' : '#f0f6fc';
-        svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="18" fill="none" stroke="\${hoverStroke}" stroke-width="1.6" stroke-dasharray="3 2" />\`;
+        svg += \`<circle class="hover-ring" cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="20.2" fill="none" stroke="\${hoverStroke}" stroke-width="1.5" stroke-dasharray="3 2" />\`;
       }
 
       if (isDead && stone) {
-        svg += \`<line x1="\${(x - 12.5).toFixed(2)}" y1="\${(y - 12.5).toFixed(2)}" x2="\${(x + 12.5).toFixed(2)}" y2="\${(y + 12.5).toFixed(2)}" stroke="#f85149" stroke-width="2.2" stroke-linecap="round" />\`;
-        svg += \`<line x1="\${(x + 12.5).toFixed(2)}" y1="\${(y - 12.5).toFixed(2)}" x2="\${(x - 12.5).toFixed(2)}" y2="\${(y + 12.5).toFixed(2)}" stroke="#f85149" stroke-width="2.2" stroke-linecap="round" />\`;
+        svg += \`<line x1="\${(x - 13.2).toFixed(2)}" y1="\${(y - 13.2).toFixed(2)}" x2="\${(x + 13.2).toFixed(2)}" y2="\${(y + 13.2).toFixed(2)}" stroke="#f85149" stroke-width="2.2" stroke-linecap="round" />\`;
+        svg += \`<line x1="\${(x + 13.2).toFixed(2)}" y1="\${(y - 13.2).toFixed(2)}" x2="\${(x - 13.2).toFixed(2)}" y2="\${(y + 13.2).toFixed(2)}" stroke="#f85149" stroke-width="2.2" stroke-linecap="round" />\`;
       }
 
       if (isLast && stone) {
         const ringColor = stone === 'B' ? '#f0f6fc' : '#1f6feb';
-        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="9.8" fill="none" stroke="\${ringColor}" stroke-width="2.0" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="9.6" fill="none" stroke="\${ringColor}" stroke-width="1.85" />\`;
+        svg += \`<circle cx="\${x.toFixed(2)}" cy="\${y.toFixed(2)}" r="2.6" fill="\${ringColor}" opacity="0.9" />\`;
       }
       return svg;
     }
 
     function buildLineGridBoardSvg(size, grid, lastMove, koPoint, est, toPlay) {
       const V = 1000;
-      const pad = size === 19 ? 48 : size === 13 ? 65 : 92;
+      const profile = BOARD_AESTHETIC_PROFILES[size] || BOARD_AESTHETIC_PROFILES[19];
+      const pad = profile.pad;
       const span = V - pad * 2;
       const step = size > 1 ? span / (size - 1) : span;
-      const crossArm = size === 19 ? 8 : size === 13 ? 12 : 18;
-      const fontSize = size === 19 ? 18 : size === 13 ? 22 : 26;
+      const crossArm = profile.crossArm;
+      const fontSize = profile.fontSize;
 
       let svg = \`<svg class="board-svg" viewBox="0 0 \${V} \${V}" xmlns="http://www.w3.org/2000/svg">\`;
       svg += \`<defs>
@@ -1412,12 +1487,12 @@ const HTML_PAGE = `<!DOCTYPE html>
       // Subtle board surface & outer line frame (外边线条框绘制)
       svg += \`<rect x="0" y="0" width="\${V}" height="\${V}" rx="8" fill="#0f141c" />\`;
       // Outer line box frame enclosing board and coordinates
-      svg += \`<rect x="8" y="8" width="\${V - 16}" height="\${V - 16}" rx="6" fill="none" stroke="#58a6ff" stroke-width="2.6" />\`;
-      svg += \`<rect x="14" y="14" width="\${V - 28}" height="\${V - 28}" rx="4" fill="none" stroke="#21262d" stroke-width="1.2" />\`;
+      svg += \`<rect x="6" y="6" width="\${V - 12}" height="\${V - 12}" rx="5" fill="none" stroke="#58a6ff" stroke-width="2.2" />\`;
+      svg += \`<rect x="11" y="11" width="\${V - 22}" height="\${V - 22}" rx="3.5" fill="none" stroke="#21262d" stroke-width="1.1" />\`;
 
-      // Coordinate labels (Top, Bottom, Left, Right)
-      const labelPos = (pad * 0.32).toFixed(2);
-      const labelEnd = (V - pad * 0.32).toFixed(2);
+      // Coordinate labels (Top, Bottom, Left, Right) positioned at the optical midpoint of the margin
+      const labelPos = (pad * profile.labelOffsetRatio).toFixed(2);
+      const labelEnd = (V - pad * profile.labelOffsetRatio).toFixed(2);
       for (let c = 0; c < size; c++) {
         const x = (pad + c * step).toFixed(2);
         const lbl = COLS[c];
@@ -1427,19 +1502,19 @@ const HTML_PAGE = `<!DOCTYPE html>
       for (let r = 1; r <= size; r++) {
         const rIdx = size - r;
         const y = (pad + rIdx * step).toFixed(2);
-        svg += \`<text x="\${labelPos}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
-        svg += \`<text x="\${labelEnd}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${labelPos}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" style="font-variant-numeric: tabular-nums" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
+        svg += \`<text x="\${labelEnd}" y="\${y}" fill="#8b949e" font-weight="600" font-size="\${fontSize}" style="font-variant-numeric: tabular-nums" text-anchor="middle" dominant-baseline="central">\${r}</text>\`;
       }
 
       // Square Grid Lines (Horizontal & Vertical lines) and outer perimeter line frame
       const start = pad.toFixed(2);
       const end = (V - pad).toFixed(2);
-      svg += \`<rect x="\${start}" y="\${start}" width="\${(V - pad * 2).toFixed(2)}" height="\${(V - pad * 2).toFixed(2)}" fill="none" stroke="#8b949e" stroke-width="3.2" />\`;
+      svg += \`<rect x="\${start}" y="\${start}" width="\${(V - pad * 2).toFixed(2)}" height="\${(V - pad * 2).toFixed(2)}" fill="none" stroke="#8b949e" stroke-width="\${profile.borderStroke}" />\`;
       for (let i = 0; i < size; i++) {
         const pos = (pad + i * step).toFixed(2);
         const isBorder = i === 0 || i === size - 1;
         const strokeColor = isBorder ? '#8b949e' : '#3b434d';
-        const strokeW = isBorder ? '2.8' : (size === 19 ? '1.5' : '2.0');
+        const strokeW = isBorder ? String(profile.borderStroke) : String(profile.gridStroke);
         // Horizontal line
         svg += \`<line x1="\${start}" y1="\${pos}" x2="\${end}" y2="\${pos}" stroke="\${strokeColor}" stroke-width="\${strokeW}" />\`;
         // Vertical line
@@ -1453,7 +1528,7 @@ const HTML_PAGE = `<!DOCTYPE html>
         for (let c = 0; c < size; c++) {
           if (!isHoshi(size, c, r)) continue;
           const x = pad + c * step;
-          svg += \`<g class="hoshi-cross" stroke="#d29922" stroke-width="\${size === 19 ? '2.4' : '3.4'}" stroke-linecap="square">\`;
+          svg += \`<g class="hoshi-cross" stroke="#d29922" stroke-width="\${profile.hoshiStroke}" stroke-linecap="square">\`;
           svg += \`<line x1="\${(x - crossArm).toFixed(2)}" y1="\${y.toFixed(2)}" x2="\${(x + crossArm).toFixed(2)}" y2="\${y.toFixed(2)}" />\`;
           svg += \`<line x1="\${x.toFixed(2)}" y1="\${(y - crossArm).toFixed(2)}" x2="\${x.toFixed(2)}" y2="\${(y + crossArm).toFixed(2)}" />\`;
           svg += \`</g>\`;
@@ -1488,7 +1563,7 @@ const HTML_PAGE = `<!DOCTYPE html>
           }
 
           // Invisible hit target covering the intersection square
-          svg += \`<rect x="\${(x - step * 0.48).toFixed(2)}" y="\${(y - step * 0.48).toFixed(2)}" width="\${(step * 0.96).toFixed(2)}" height="\${(step * 0.96).toFixed(2)}" fill="transparent" />\`;
+          svg += \`<rect x="\${(x - step * 0.49).toFixed(2)}" y="\${(y - step * 0.49).toFixed(2)}" width="\${(step * 0.98).toFixed(2)}" height="\${(step * 0.98).toFixed(2)}" fill="transparent" />\`;
           svg += \`</g>\`;
         }
       }
@@ -1503,11 +1578,15 @@ const HTML_PAGE = `<!DOCTYPE html>
       const est = state.estimateActive ? computeEstimate(grid, capB, capW) : null;
       if (est) state.estimateSummary = est.summary;
 
-      // Update size buttons active state
+      // Update size buttons active state and apply tiered board container scale (9 < 13 < 19)
       [9, 13, 19].forEach(sz => {
         const btn = document.getElementById('btn-size-' + sz);
         if (btn) btn.classList.toggle('active-size', state.size === sz);
       });
+      const tuiViewEl = document.getElementById('tui-view');
+      if (tuiViewEl) tuiViewEl.setAttribute('data-size', String(state.size));
+      const boardContainerEl = document.getElementById('board-container');
+      if (boardContainerEl) boardContainerEl.setAttribute('data-size', String(state.size));
 
       const modeLabel = state.estimateActive ? 'estimate' : isReviewing() ? 'review' : 'board';
       document.getElementById('board-title').textContent =
@@ -1516,7 +1595,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       document.getElementById('turn-indicator').textContent =
         \`Turn: \${toPlay === 'B' ? '● Black' : '○ White'}\${koBadge}\`;
 
-      document.getElementById('board-container').innerHTML =
+      boardContainerEl.innerHTML =
         buildLineGridBoardSvg(state.size, grid, lastMove, koPoint, est, toPlay);
 
       // Moves pane

@@ -157,22 +157,19 @@ pub fn stone_radii_for_size(_size: u8, col_step: u16, row_step: u16) -> (u16, u1
 }
 
 /// Computes optimal `(col_step, row_step)` enforcing a strict 2:1 character aspect ratio
-/// (`col_step == row_step * 2`) so 9x9, 13x13, and 19x19 boards are ALWAYS rendered as a
-/// true 1:1 geometric square (正四边形) in terminal character cells, never a rectangle.
-pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
+fn max_fitting_row_step(area: Rect, size: u8) -> u16 {
     if size <= 1 {
-        return (2, 1);
+        return 1;
     }
     let gaps = u16::from(size - 1);
-
     let mut best_row_step = 1u16;
     for r in 1..=style_or_nearest(size).max_row_step() {
         let c = r * 2;
         let (rx, ry) = stone_radii_for_size(size, c, r);
         let needed_w = LABEL_WIDTH + rx * 2 + gaps * c + 1;
-        // Growing past the smallest spacing is only worth it if the column
-        // letters still fit above the board.
-        let label_row = u16::from(r > 1);
+        // For 19x19, allow full-scale step r >= 2 as soon as the grid + stone
+        // extents fit vertically; smaller boards also reserve a top label row.
+        let label_row = u16::from(r > 1 && size < 19);
         let needed_h = gaps * r + 1 + ry * 2 + label_row;
         if needed_w <= area.width && needed_h <= area.height {
             best_row_step = r;
@@ -180,6 +177,26 @@ pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
             break;
         }
     }
+    best_row_step
+}
+
+/// Computes optimal `(col_step, row_step)` enforcing:
+/// 1. Strict 2:1 character aspect ratio (`col_step == row_step * 2`) so 9x9, 13x13, and 19x19
+///    boards are ALWAYS rendered as a true 1:1 geometric square (正四边形).
+/// 2. Tiered visual hierarchy (`9x9 < 13x13 < 19x19`): smaller road sizes never expand to a
+///    larger grid footprint than larger road sizes in the same viewport.
+pub fn compute_board_steps(area: Rect, size: u8) -> (u16, u16) {
+    if size <= 1 {
+        return (2, 1);
+    }
+    let raw = max_fitting_row_step(area, size);
+    let r19 = max_fitting_row_step(area, 19);
+    let r13 = max_fitting_row_step(area, 13).min(r19);
+    let best_row_step = match size {
+        0..=10 => raw.min(r13),
+        11..=15 => raw.min(r19),
+        _ => raw,
+    };
 
     (best_row_step * 2, best_row_step)
 }
@@ -207,13 +224,6 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
     if area.width == 0 || area.height == 0 || size == 0 {
         return None;
     }
-    // Keep one cell on every side for the board's frame, so the frame never
-    // lands on the coordinate labels or the stones.
-    let area = if area.width > 2 && area.height > 2 {
-        Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
-    } else {
-        area
-    };
     let (col_step, row_step) = compute_board_steps(area, size);
     let (stone_rx, stone_ry) = stone_radii_for_size(size, col_step, row_step);
     let gaps = u16::from(size.saturating_sub(1));
@@ -225,6 +235,13 @@ fn compute_metrics(area: Rect, size: u8) -> Option<BoardMetrics> {
     if area.width < min_w || area.height < min_h {
         return None;
     }
+    // Keep one cell on every side for the board's outer frame whenever there is
+    // room beyond the chosen step's minimum footprint.
+    let area = if area.width >= min_w + 2 && area.height >= min_h + 2 {
+        Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2)
+    } else {
+        area
+    };
 
     let show_top_coords = area.height >= grid_h + 2;
     let top_pad = if area.height >= grid_h + 2 + stone_ry * 2 {
@@ -703,6 +720,36 @@ mod tests {
             assert!(
                 !rendered.contains('╭') && !rendered.contains('╰'),
                 "no hollow rectangular box borders on {size}x{size}"
+            );
+        }
+    }
+
+    #[test]
+    fn board_size_hierarchy_scales_up_from_9_to_13_to_19() {
+        for &(w, h) in &[
+            (60u16, 24u16),
+            (80, 40),
+            (100, 42),
+            (120, 45),
+            (160, 60),
+        ] {
+            let area = Rect::new(0, 0, w, h);
+            let m9 = compute_metrics(area, 9).expect("9x9 metrics");
+            let m13 = compute_metrics(area, 13).expect("13x13 metrics");
+            let m19 = compute_metrics(area, 19).expect("19x19 metrics");
+            assert!(
+                m9.grid_w < m13.grid_w && m13.grid_w < m19.grid_w,
+                "in {w}x{h}: expected grid_w 9x9 ({}) < 13x13 ({}) < 19x19 ({})",
+                m9.grid_w,
+                m13.grid_w,
+                m19.grid_w
+            );
+            assert!(
+                m9.grid_h < m13.grid_h && m13.grid_h < m19.grid_h,
+                "in {w}x{h}: expected grid_h 9x9 ({}) < 13x13 ({}) < 19x19 ({})",
+                m9.grid_h,
+                m13.grid_h,
+                m19.grid_h
             );
         }
     }
